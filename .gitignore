@@ -216,3 +216,23 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Claude Code worktrees (git worktree のネストを誤コミットしないための除外)
+.claude/worktrees/
+
+# --- 実データ（絶対にコミットしない） ---
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+effort.db*
+
+# --- ローカル設定（社内固有値を含む） ---
+config.toml
+.claude/settings.local.json
+
+# --- セッションログのコピー（誤って持ち込んだ場合の保険） ---
+*.jsonl
+!tests/fixtures/**/*.jsonl

@@ -1,0 +1,45 @@
+[project]
+name = "agent-effort-db"
+version = "0.1.0"
+description = "Claude Code / AI エージェントの実工数を収集・蓄積するローカルDB & CLI"
+readme = "README.md"
+authors = [
+    { name = "Toshiki Imagawa", email = "6396938+ToshikiImagawa@users.noreply.github.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "typer>=0.12",
+]
+
+[project.scripts]
+effort-db = "effort_db.cli:app"
+
+[build-system]
+requires = ["uv_build>=0.11.5,<0.12.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "effort_db"
+
+[dependency-groups]
+dev = [
+    "mypy>=1.13",
+    "pytest>=8.3",
+    "ruff>=0.7",
+]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+
+[tool.mypy]
+python_version = "3.12"
+packages = ["effort_db"]
+mypy_path = "src"
+strict = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
