@@ -1,0 +1,2 @@
+{"type":"user","uuid":"su1","timestamp":"2026-01-05T10:05:03.000Z","cwd":"/Users/dev/src/example.com/acme/widget","gitBranch":"feat/sample","isSidechain":true,"message":{"role":"user","content":"サブエージェントへの指示"}}
+{"type":"assistant","uuid":"sa1","timestamp":"2026-01-05T10:05:20.000Z","cwd":"/Users/dev/src/example.com/acme/widget","gitBranch":"feat/sample","isSidechain":true,"message":{"role":"assistant","content":[{"type":"tool_use","id":"tool-s1","name":"Read","input":{}}]}}

@@ -1,0 +1,4 @@
+{"type":"user","uuid":"u1","timestamp":"2026-01-09T08:00:00.000Z","cwd":"/Users/dev/src/example.com/acme/widget","gitBranch":"main","isSidechain":false,"message":{"role":"user","content":"main で調べ物"}}
+{"type":"assistant","uuid":"a1","timestamp":"2026-01-09T08:00:10.000Z","cwd":"/Users/dev/src/example.com/acme/widget","gitBranch":"main","isSidechain":false,"message":{"role":"assistant","content":[{"type":"text","text":"調べました"}]}}
+{"type":"user","uuid":"u2","timestamp":"2026-01-09T08:10:00.000Z","cwd":"/Users/dev/src/example.com/acme/widget","gitBranch":"main","isSidechain":false,"message":{"role":"user","content":"もう少し"}}
+{"type":"assistant","uuid":"a2","timestamp":"2026-01-09T08:10:10.000Z","cwd":"/Users/dev/src/example.com/acme/widget","gitBranch":"feat/late-switch","isSidechain":false,"message":{"role":"assistant","content":[{"type":"text","text":"ブランチを切りました"}]}}

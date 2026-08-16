@@ -1,0 +1,6 @@
+{"type":"user","uuid":"u1","timestamp":"2026-01-06T09:00:00.000Z","cwd":"/Users/dev/src/example.com/acme/widget","gitBranch":"main","isSidechain":false,"message":{"role":"user","content":"依頼"}}
+{"type":"assistant","uuid":"a1","timestamp":"2026-01-06T09:00
+これは JSON ではない行
+[1, 2, 3]
+
+{"type":"assistant","uuid":"a2","timestamp":"2026-01-06T09:01:00.000Z","cwd":"/Users/dev/src/example.com/acme/widget","gitBranch":"main","isSidechain":false,"message":{"role":"assistant","content":[{"type":"tool_use","id":"tool-1","name":"Grep","input":{}}]}}

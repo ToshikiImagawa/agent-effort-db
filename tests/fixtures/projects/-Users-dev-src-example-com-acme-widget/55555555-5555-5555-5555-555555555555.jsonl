@@ -1,0 +1,3 @@
+{"type":"user","uuid":"u1","timestamp":"2026-01-07T12:00:00.000Z","cwd":"/Users/dev/src/example.com/acme/widget","gitBranch":"feat/interrupt-field","isSidechain":false,"message":{"role":"user","content":"依頼"}}
+{"type":"assistant","uuid":"a1","timestamp":"2026-01-07T12:00:05.000Z","cwd":"/Users/dev/src/example.com/acme/widget","gitBranch":"feat/interrupt-field","isSidechain":false,"message":{"role":"assistant","content":[{"type":"tool_use","id":"tool-1","name":"Bash","input":{}}]}}
+{"type":"user","uuid":"u2","parentUuid":"a1","timestamp":"2026-01-07T12:00:30.000Z","cwd":"/Users/dev/src/example.com/acme/widget","gitBranch":"feat/interrupt-field","isSidechain":false,"interruptedMessageId":"a1","message":{"role":"user","content":"やめて別のことをして"}}
