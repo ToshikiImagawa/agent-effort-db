@@ -82,7 +82,7 @@ GitHub の PR の経過時間はレビュー待ち・放置を含みノイジー
 | FR-004 | セッションのツール呼び出し回数を計上できる。主エージェントとサブエージェントの回数を区別して保持する         | 必須  | FR_002_02         |
 | FR-005 | セッションの実経過時間を算出できる                                         | 必須  | FR_002_03         |
 | FR-006 | セッションのトークン使用量（入力・出力・キャッシュ読み取り）を計上できる                       | 必須  | FR_002_04         |
-| FR-007 | 1 セッションが複数のログファイルに分割されている場合、同一セッションとして束ねて実測値を算出できる         | 必須  | FR_002            |
+| FR-007 | セッション本体のログのみを収集対象とし、サブエージェント transcript や workflow ジャーナルをセッションとして扱わない | 必須  | FR_002            |
 | FR-008 | 対象リポジトリの PR メタ情報を取り込める                                    | 必須  | FR_003            |
 | FR-009 | セッション識別子を指定して 1 件だけ取り込める。結果は一括取り込みと一致する                    | 必須  | FR_004            |
 | FR-010 | リポジトリとブランチの組でセッションと PR を突き合わせられる                          | 必須  | FR_005_01         |
@@ -120,9 +120,9 @@ GitHub の PR の経過時間はレビュー待ち・放置を含みノイジー
 | `effort_db`               | `schema`             | `connect(db_path) -> Connection`            | DB への接続を取得する。永続化技術は design が定める                  |
 | `effort_db`               | `schema`             | `init_db(conn) -> None`                     | テーブル・ビューを冪等に作成する（FR-001）                        |
 | `effort_db`               | `schema`             | `SCHEMA_VERSION`                            | スキーマバージョン                                       |
-| `effort_db.collectors`    | `session`            | `iter_session_sources(root) -> Iterator[SessionSource]` | 収集対象のログ所在を列挙し、セッション識別子ごとに束ねる（FR-002 / FR-007）        |
-| `effort_db.collectors`    | `session`            | `parse_session(source) -> SessionRecord`    | 1 セッション分のログ群から実測値を導出する（FR-003〜FR-007）           |
-| `effort_db.collectors`    | `session`            | `collect_sessions(conn, sources) -> CollectResult` | セッションを DB へ収束保存する（FR-002 / FR-019）               |
+| `effort_db.collectors`    | `session`            | `iter_session_files(root) -> Iterator[Path]`  | セッション本体のログを列挙する（FR-002 / FR-007）                    |
+| `effort_db.collectors`    | `session`            | `parse_session_file(path) -> SessionRecord` | 1 ファイルから実測値を導出する（FR-003〜FR-006）                  |
+| `effort_db.collectors`    | `session`            | `collect_all(conn, root) -> CollectResult`   | セッションを DB へ収束保存する（FR-002 / FR-019）               |
 | `effort_db.collectors`    | `github`             | `fetch_pull_requests(repo) -> list[PullRequestRecord]` | PR メタ情報を取得する（FR-008）                            |
 | `effort_db.collectors`    | `github`             | `collect_pull_requests(conn, repo) -> CollectResult` | PR を DB へ収束保存する（FR-008 / FR-019）                 |
 | `effort_db`               | `linker`             | `extract_issue_key(text, patterns) -> str \| None` | 文字列からチケットキーを抽出する（FR-012）                        |
@@ -137,7 +137,6 @@ GitHub の PR の経過時間はレビュー待ち・放置を含みノイジー
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
-from pathlib import Path
 
 
 class LinkSource(Enum):
@@ -151,14 +150,6 @@ class LinkSource(Enum):
     LOG_REFERENCE = "log_reference"   # セッションログ内の PR 参照
     REPO_BRANCH = "repo_branch"       # リポジトリとブランチの一致
     UNLINKED = "unlinked"             # リンク不在を表す（永続化しない。FR-014）
-
-
-@dataclass(frozen=True)
-class SessionSource:
-    """1 セッションを構成するログの所在。1 セッションが複数ファイルに分かれる場合を含む（FR-007）。"""
-
-    session_id: str
-    paths: tuple[Path, ...]
 
 
 @dataclass(frozen=True)
@@ -179,7 +170,7 @@ class SessionRecord:
     output_tokens: int               # FR-006
     cache_read_tokens: int           # FR-006
     log_versions: tuple[str, ...]    # 観測されたログ形式バージョン（NFR-004）
-    source_file_count: int           # 構成ログファイル数（FR-007）
+    interrupted: bool                # 中断の有無。構造フィールドとテキストマーカーの両方で判定する
     skipped_records: int             # 解釈できずスキップしたレコード数（NFR-003）
 
 
@@ -350,7 +341,7 @@ from effort_db.collectors import session
 conn = schema.connect(config.resolve_db_path())
 schema.init_db(conn)
 
-result = session.collect_sessions(conn, session.iter_session_sources())
+result = session.collect_all(conn)
 print(result.inserted, result.updated, result.skipped_records)
 
 link_result = linker.resolve_links(conn, config.load_config().issue_key_patterns)
@@ -385,7 +376,9 @@ sequenceDiagram
     CLI -->>- Dev: 追加 / 更新 / スキップ件数
 ```
 
-`SessionSource` が複数ファイルを持つ場合、それらを 1 セッションとして束ねてから計上する（FR-007）。
+列挙の段でセッション本体だけに絞る（FR-007）。
+サブエージェント transcript は親セッションのツール呼び出しとして加算するが、ターン数には加算しない。
+workflow ジャーナルは複数セッションで同名のため、セッションとして扱うと識別子が衝突する。
 
 ## 7.2. 突き合わせの段階適用
 
@@ -473,6 +466,7 @@ sequenceDiagram
 |:-----------|:------------------|:-----------------------|
 | FR_001     | DB 初期化            | FR-001                 |
 | FR_002     | セッションログの一括取り込み    | FR-002 / FR-007        |
+| FR_002（対象の絞り込み） | セッション本体のみを対象とする   | FR-007                 |
 | FR_002_01  | ターン数の計上           | FR-003                 |
 | FR_002_02  | ツール呼び出し回数の計上      | FR-004                 |
 | FR_002_03  | 実経過時間の算出          | FR-005                 |
@@ -511,8 +505,13 @@ PRD にない要件を spec で追加した。いずれも PRD の要求を実�
 
 | spec 要件  | 追加理由                                                                 |
 |:---------|:---------------------------------------------------------------------|
-| FR-007   | 1 セッションが複数ログファイルに分割される場合があり、束ねる処理がなければ FR_002 の実測値が正しく算出できない        |
+| FR-007   | ログツリーにはセッション本体でない transcript が同居し、区別しなければ実測値が汚染される（workflow ジャーナルは複数セッションで同名） |
 | FR-013   | FR_007（キー種別ごとの join 率）を実現するには、リンクの由来を保持する必要がある                      |
 | FR-004（区別保持） | サブエージェントのツール呼び出しが無視できない規模を占めるため、A-002 に従い区別して保持する                    |
 
-FR-007 と FR-013 は PRD への昇格候補である。design での検証後に PRD へ反映するかを判断する。
+FR-013 は PRD への昇格候補である。design での検証後に PRD へ反映するかを判断する。
+
+> **訂正記録（2026-08-16）**: 当初 FR-007 を「1 セッションが複数ログファイルに分割される場合に束ねる」と定義していたが、
+> これは観測の誤り（セッション本体でないファイルを母集団に混入させた）に基づくものだった。
+> セッション本体に限れば 1 ファイル = 1 セッションである（design O4 / O8）。
+> 本要件は「本体以外のファイルを誤ってセッションとして扱わない」という実在の要件に置き換えた。

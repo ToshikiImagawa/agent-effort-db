@@ -8,9 +8,11 @@ Claude Code / AI エージェントの実工数を収集・蓄積するローカ
 
 Claude Code が出す工数見積もりは「人間が実施する前提」で大きく外れることが多い。そこで**実際にかかった工数を実測データから蓄積し、見積もりの指標（reference class）として使えるDB** を作ることが目的。
 
-パッケージ骨格と `effort-db init` は実装済み（`config.py` / `schema.py` / `cli.py`）。
-`collectors/session.py` / `collectors/github.py` / `linker.py` と、CLI の `backfill` / `collect-session` / `stats` / `query` は未実装。
-実装状況の最新はロードマップの進捗サマリを参照すること（記述より実態が真実。着手前に Glob/Grep で検証する）。
+**CLI コマンド一式は実装済み**（`init` / `backfill sessions` / `backfill prs` / `collect-session` / `stats` / `relink` / `query`）。
+ただし**実測データに基づく設計判断に実装が追随していない項目が 5 つ残る**（最重要: join キー。現状の実装では実データに 1 件も紐付かない）。
+差分の一覧は `_design.md` の 1.1、残作業は [ROADMAP.md](ROADMAP.md) の M7 を参照すること。
+
+実装状況は記述より実態が真実。着手前に必ず Glob/Grep で検証する。
 
 ## 参照すべきドキュメント
 
@@ -66,18 +68,20 @@ Claude Code が出す工数見積もりは「人間が実施する前提」で�
 agent-effort-db/
 ├── pyproject.toml          # [project.scripts] effort-db = "effort_db.cli:app"
 ├── src/effort_db/
-│   ├── cli.py              # typer アプリ（実装済み: init のみ）
-│   ├── schema.py           # DDL + マイグレーション（v1 実装済み / v2 拡張予定）
-│   ├── config.py           # DBパス等の設定解決（DBパスは実装済み）
-│   ├── models.py           # 型定義（未作成）
-│   ├── stats.py            # 健全性集計（未作成）
-│   ├── collectors/
-│   │   ├── session.py      # jsonl パーサ（最重要・作り込みポイント / 未作成）
-│   │   └── github.py       # gh CLI ラッパー（未作成）
-│   └── linker.py           # 突き合わせの段階適用（docstring のみ）
+│   ├── cli.py              # typer アプリ（全コマンド実装済み）
+│   ├── schema.py           # DDL + マイグレーション（v1 のみ。v2 は M7-C）
+│   ├── config.py           # DBパス / issue_key パターンの解決（実装済み）
+│   └── collectors/
+│       ├── session.py      # jsonl パーサ（実装済み・最重要の作り込みポイント）
+│       └── github.py       # gh CLI ラッパー（実装済み）
+│   └── linker.py           # issue_key 抽出 / relink / 健全性集計（実装済み）
 └── tests/
-    └── fixtures/           # 合成jsonlのみ
+    ├── fixtures/projects/  # 合成jsonlのみ（実ログのコピー禁止）
+    └── test_*.py           # 61 件
 ```
+
+`models.py` / `stats.py` は `_design.md` の設計上のモジュール分割であり、現在は未作成
+（型は各モジュール内に、健全性集計は `linker.py` に置かれている）。
 
 CLI は `init` / `backfill sessions` / `backfill prs` / `collect-session` / `link` / `stats` / `query`。
 `link` を独立コマンドとするのは、PR を後から取り込んだ際にセッション再収集なしでリンクを作り直せるようにするため。
@@ -109,13 +113,14 @@ effort-db query "..."               # 素のSQL逃げ道
 
 ## 実装時の注意点
 
-- **実ログ構造の調査は完了している**。観測結果は `_design.md` 9.1（O1〜O15）、そこから導いた判断は 9.2（D1〜D13）にある。実装前に必ず参照すること。推測で作り直さない
+- **実ログ構造の調査は完了している**。観測結果は `_design.md` 9.1（O1〜O17）、そこから導いた判断は 9.2（D1〜D18）にある。実装前に必ず参照すること。推測で作り直さない
+- **観測を追記する際は「何を母集団としたか」を必ず書く**（9.1 の「標本」列）。セッション本体は `<project>/<UUID>.jsonl` の 1 階層のみで、`subagents/` と `workflows/` は本体ではない。これを混ぜて集計した結果、存在しない問題に対して設計してしまった前例がある（`_design.md` v0.3 の教訓）
 - 特に注意すべき観測事実:
     - ターン数は**人由来の発話のみ**を数える。`user` レコードの約 91% はツール応答であり、含めると意味を失う（D1）
     - ツール呼び出しの約 37% がサブエージェント内。主エージェントと別列で保持する（D2）
-    - 1 セッションが複数ファイルに分割される場合がある（約 16%）。ファイル単位で集計しない（D4）
-    - セッション識別子はレコード内のキーから取る。ファイル名とは一致しないことが多い（D3）
-    - セッション識別子のキー名に揺れがある。優先順で探索し、片方に依存しない（D3）
+    - 実経過時間は min / max で求める。時刻は約 64% のファイルで逆行する（D5 / O17）
+    - ブランチ名にチケットキーを含むものは実データに 1 件も無い。`issue_key` 単独では join できない（D6 / O10）
+    - セッション本体は 1 ファイル = 1 セッションで、ファイル名が識別子と 100% 一致する（D3 / D4 / O4 / O8）
 - 実装中に新しい観測事実が見つかったら、**まず `_design.md` 9.1 に追記し、その後 9.2 の判断を更新する**。判断を先に書いて後から根拠を探さない
 - 探索で見た実ログ断片をそのままテストに固定しないこと。テストは「値」ではなく「関係」を検証する（例: ツール応答を N 件加えてもターン数が変わらない）
 - `stats` は join 率を**キー種別ごとに**表示する。低い場合は抽出ロジックの複雑化ではなく、より確実なキーの採用または命名規約の見直しを先に検討する
