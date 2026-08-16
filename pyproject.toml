@@ -31,6 +31,12 @@ dev = [
 [tool.ruff]
 line-length = 100
 src = ["src", "tests"]
+# ruff 0.16 以降は Markdown 内の Python コードブロックも format 対象になる。
+# ドキュメントはフォーマッタの対象にしない。理由:
+#   - `.sdd/` の設計ドキュメントは意図的にコメントを整列させており、整形で崩れる
+#   - 実装作業中に `ruff format .` を叩くと、担当スコープ外の差分が PR に混入する
+# lint（`ruff check`）は元から .py のみを対象とするため、除外による検査漏れは生じない。
+extend-exclude = ["*.md"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP"]
