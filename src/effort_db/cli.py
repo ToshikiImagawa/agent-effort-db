@@ -8,7 +8,7 @@ import sqlite3
 import typer
 
 from effort_db import config, linker, schema
-from effort_db.collectors import session
+from effort_db.collectors import github, session
 
 app = typer.Typer(help="Claude Code / AIエージェントの実工数を収集・蓄積するCLI")
 backfill_app = typer.Typer(help="過去データの一括取り込み（未実装）")
@@ -50,9 +50,34 @@ def backfill_sessions() -> None:
 @backfill_app.command("prs")
 def backfill_prs(
     repo: str = typer.Option(..., "--repo", help="対象リポジトリ (owner/repo)"),
+    limit: int = typer.Option(
+        github.DEFAULT_LIMIT, "--limit", min=1, help="ghから取得するマージ済みPRの最大件数"
+    ),
 ) -> None:
-    """gh経由でPR取得（未実装）。"""
-    _not_implemented("backfill prs")
+    """gh経由でマージ済みPRを取得し pull_requests に upsert する（冪等）。"""
+    try:
+        rows = github.fetch_merged_prs(repo, limit=limit)
+    except github.GhError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+
+    db_path = config.resolve_db_path()
+    conn = sqlite3.connect(db_path)
+    try:
+        # init 未実行でも動くようにテーブル作成を通す（init_db は冪等）。
+        schema.init_db(conn)
+        count = github.upsert_pull_requests(conn, rows)
+    finally:
+        conn.close()
+
+    typer.echo(f"{count} PRs upserted from {repo}")
+    if len(rows) >= limit:
+        # ちょうど limit 件だった場合と打ち切られた場合は区別できないため、断定せず警告する。
+        typer.echo(
+            f"警告: 取得件数が --limit {limit} に達しました。これより古いPRは取得できて"
+            "いない可能性があります。全件必要な場合は --limit を増やして再実行してください。",
+            err=True,
+        )
 
 
 @app.command("collect-session")

@@ -1,1 +1,1 @@
-"""データ収集モジュール群（session.py / github.py の実装は別issue）。"""
+"""データ収集モジュール群（session.py: セッションログ / github.py: PR）。"""
