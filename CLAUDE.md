@@ -8,14 +8,31 @@ Claude Code / AI エージェントの実工数を収集・蓄積するローカ
 
 Claude Code が出す工数見積もりは「人間が実施する前提」で大きく外れることが多い。そこで**実際にかかった工数を実測データから蓄積し、見積もりの指標（reference class）として使えるDB** を作ることが目的。
 
-現時点では `src/effort_db/` 等のパッケージ骨格・実装コードは未着手（README.md / .gitignore / `.sdd/` / `.claude/` のみ存在）。以降のセクションは決定済みの設計方針であり、実装時はこれに従うこと。
+パッケージ骨格と `effort-db init` は実装済み（`config.py` / `schema.py` / `cli.py`）。
+`collectors/session.py` / `collectors/github.py` / `linker.py` と、CLI の `backfill` / `collect-session` / `stats` / `query` は未実装。
+実装状況の最新はロードマップの進捗サマリを参照すること（記述より実態が真実。着手前に Glob/Grep で検証する）。
+
+## 参照すべきドキュメント
+
+以下が本プロジェクトの真実の源である。実装・設計判断の前に参照すること。
+
+| ドキュメント                                          | 役割                                                     |
+|:------------------------------------------------|:-------------------------------------------------------|
+| [CONSTITUTION.md](.sdd/CONSTITUTION.md)         | 交渉不可の原則（B/A/D/T）。設計・実装はすべてこれに準拠する                      |
+| [effort-db.md](.sdd/requirement/effort-db.md)   | PRD。何を・なぜ作るか（要求 ID: REQ / FR / PR / IR / DC）            |
+| [ROADMAP.md](ROADMAP.md)                        | M0〜M7 のマイルストーンと完了条件。実装順序と現在地                           |
+
+以降のセクションは決定済みの設計方針の要約である。詳細と根拠は上記ドキュメントが持つ。
+記述が食い違う場合は CONSTITUTION.md と PRD を優先する。
 
 ## 設計判断の背景
 
 - GitHub の issue/PR の経過時間はレビュー待ち・放置を含みノイジー → 補助的な特徴量として使う
 - **本命は Claude Code 自身のセッションログ**（`~/.claude/projects/**/*.jsonl`）。ターン数・ツール呼び出し回数・実経過時間が取れる
 - 見積もり単位は「人日」ではなく「セッション数 / ターン数 / 実時間」などエージェントネイティブな単位とし、点推定ではなく分布（中央値/p90）で扱う
-- セッション ↔ PR ↔ Jira の join キーはブランチ名等に含まれるチケットキー（例: `ABC-123`）。紐付かないレコードは捨てず `unlinked` として保持する
+- セッション ↔ PR の join キーは **`(repo, branch)` を主軸**とし、セッションログ内の PR 参照が得られる場合はそれを優先する。チケットキーは補助的な集約キーであり、単独の主キーとしない（形式は `config.toml` から与える。ドキュメント・コード中に実在のプロジェクトキーを書かない）
+    - 実ログ調査の結果、ブランチ名にチケットキーを含むものは 1.3% にとどまり、チケットキー主軸では集約が成立しないことが判明した。観測結果は `_design.md` の 9.1、判断の根拠は 9.2（D6）にある
+- 紐付かないレコードは捨てず `unlinked` として保持する。リンクには**由来**（どのキーで紐付いたか）を記録し、join 率をキー種別ごとに観測できるようにする
 
 ## アーキテクチャ方針（決定済み）
 
@@ -49,40 +66,59 @@ Claude Code が出す工数見積もりは「人間が実施する前提」で�
 agent-effort-db/
 ├── pyproject.toml          # [project.scripts] effort-db = "effort_db.cli:app"
 ├── src/effort_db/
-│   ├── cli.py              # typer アプリ
-│   ├── schema.py           # DDL + マイグレーション
-│   ├── config.py           # DBパス等の設定解決
+│   ├── cli.py              # typer アプリ（実装済み: init のみ）
+│   ├── schema.py           # DDL + マイグレーション（v1 実装済み / v2 拡張予定）
+│   ├── config.py           # DBパス等の設定解決（DBパスは実装済み）
+│   ├── models.py           # 型定義（未作成）
+│   ├── stats.py            # 健全性集計（未作成）
 │   ├── collectors/
-│   │   ├── session.py      # jsonl パーサ（最重要・作り込みポイント）
-│   │   └── github.py       # gh CLI ラッパー
-│   └── linker.py           # issue_key 抽出・突き合わせ
+│   │   ├── session.py      # jsonl パーサ（最重要・作り込みポイント / 未作成）
+│   │   └── github.py       # gh CLI ラッパー（未作成）
+│   └── linker.py           # 突き合わせの段階適用（docstring のみ）
 └── tests/
     └── fixtures/           # 合成jsonlのみ
 ```
 
-## データモデル（raw層 + 集約ビューの2層構成）
+CLI は `init` / `backfill sessions` / `backfill prs` / `collect-session` / `link` / `stats` / `query`。
+`link` を独立コマンドとするのは、PR を後から取り込んだ際にセッション再収集なしでリンクを作り直せるようにするため。
 
-`sessions`（セッション単位の実測値）と `pull_requests`（PR単位のメタ情報）を raw層として持ち、`issue_key` で join した集約ビュー（例: `task_effort`）を参照側に提供する。
+## データモデル（raw層 + リンク層 + 集約ビューの3層構成）
+
+- **raw層**: `sessions`（セッション単位の実測値）/ `pull_requests`（PR単位のメタ情報）/ `session_pr_refs`（ログから抽出した PR 参照）
+- **リンク層**: `session_pr_links`（セッションと PR の対応を**由来付き**で保持）
+- **集約層**: `effort_by_branch`（`(repo, branch)` 単位）/ `effort_by_issue`（チケットキーが付与された分のみ）
+
+詳細な DDL は `_design.md` の 5 章にある。
 
 - 生データを潰して集約値だけ保存しない。raw層は必ず残す
 - インクリメンタル収集が冪等になるよう `session_id` / `(repo, pr_number)` をユニークキーにして upsert する
-- `issue_key` が抽出できないレコードも `unlinked` として捨てずに保持する
+- 突き合わせキーが得られないレコードも `unlinked` として捨てずに保持する
+- 集約ビューでリンクを JOIN すると 1 セッションが複数 PR に紐づく場合に重複計上される。PR 側の値は相関サブクエリで求める
 
 ## CLI コマンド体系（予定）
 
 ```
-effort-db init                      # DB作成
+effort-db init                      # DB作成（実装済み）
 effort-db backfill sessions         # 過去jsonl走査
 effort-db backfill prs --repo xxx   # gh経由でPR取得
 effort-db collect-session <id>      # インクリメンタル用（将来hookから）
-effort-db stats                     # join率などの健全性確認
+effort-db link                      # 突き合わせを段階適用（収集とは独立）
+effort-db stats                     # キー種別ごとのjoin率など健全性確認
 effort-db query "..."               # 素のSQL逃げ道
 ```
 
 ## 実装時の注意点
 
-- `collectors/session.py` で turns / tool_calls / wall_clock をどのフィールドから数えるかは、実ログ構造を見ながら探索的に決める（ログバージョン差異の可能性がある）。探索で見た実ログ断片をそのままテストに固定しないこと
-- `linker.py`（ブランチ名・コミットメッセージからのチケットキー抽出）実装後は `effort-db stats` で join率を確認し、低ければブランチ命名規約の見直しを先に行う
+- **実ログ構造の調査は完了している**。観測結果は `_design.md` 9.1（O1〜O15）、そこから導いた判断は 9.2（D1〜D13）にある。実装前に必ず参照すること。推測で作り直さない
+- 特に注意すべき観測事実:
+    - ターン数は**人由来の発話のみ**を数える。`user` レコードの約 91% はツール応答であり、含めると意味を失う（D1）
+    - ツール呼び出しの約 37% がサブエージェント内。主エージェントと別列で保持する（D2）
+    - 1 セッションが複数ファイルに分割される場合がある（約 16%）。ファイル単位で集計しない（D4）
+    - セッション識別子はレコード内のキーから取る。ファイル名とは一致しないことが多い（D3）
+    - セッション識別子のキー名に揺れがある。優先順で探索し、片方に依存しない（D3）
+- 実装中に新しい観測事実が見つかったら、**まず `_design.md` 9.1 に追記し、その後 9.2 の判断を更新する**。判断を先に書いて後から根拠を探さない
+- 探索で見た実ログ断片をそのままテストに固定しないこと。テストは「値」ではなく「関係」を検証する（例: ツール応答を N 件加えてもターン数が変わらない）
+- `stats` は join 率を**キー種別ごとに**表示する。低い場合は抽出ロジックの複雑化ではなく、より確実なキーの採用または命名規約の見直しを先に検討する
 
 ## 未決定事項（後回し）
 
