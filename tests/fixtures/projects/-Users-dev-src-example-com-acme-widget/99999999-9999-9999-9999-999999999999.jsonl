@@ -1,0 +1,8 @@
+{"type":"user","uuid":"u1","timestamp":"2026-01-10T11:00:00.000Z","cwd":"/Users/dev/src/example.com/acme/widget","gitBranch":"feat/pr-ref","isSidechain":false,"message":{"role":"user","content":"PR を出して"}}
+{"type":"assistant","uuid":"a1","parentUuid":"u1","timestamp":"2026-01-10T11:00:10.000Z","cwd":"/Users/dev/src/example.com/acme/widget","gitBranch":"feat/pr-ref","isSidechain":false,"message":{"role":"assistant","content":[{"type":"tool_use","id":"tool-1","name":"Bash","input":{}}]}}
+{"type":"pr-link","sessionId":"99999999-9999-9999-9999-999999999999","timestamp":"2026-01-10T11:01:00.000Z","prNumber":42,"prRepository":"acme/widget","prUrl":"https://example.com/acme/widget/pull/42"}
+{"type":"pr-link","sessionId":"99999999-9999-9999-9999-999999999999","timestamp":"2026-01-10T11:02:00.000Z","prNumber":42,"prRepository":"acme/widget","prUrl":"https://example.com/acme/widget/pull/42"}
+{"type":"pr-link","sessionId":"99999999-9999-9999-9999-999999999999","timestamp":"2026-01-10T11:03:00.000Z","prNumber":43,"prRepository":"acme/other","prUrl":"https://example.com/acme/other/pull/43"}
+{"type":"pr-link","sessionId":"99999999-9999-9999-9999-999999999999","timestamp":"2026-01-10T11:04:00.000Z","prNumber":"44","prRepository":"acme/widget","prUrl":"https://example.com/acme/widget/pull/44"}
+{"type":"pr-link","sessionId":"99999999-9999-9999-9999-999999999999","timestamp":"2026-01-10T11:05:00.000Z","prNumber":45,"prRepository":"widget","prUrl":"https://example.com/widget/pull/45"}
+{"type":"pr-link","sessionId":"99999999-9999-9999-9999-999999999999","timestamp":"2026-01-10T11:06:00.000Z","prUrl":"https://example.com/acme/widget/pull/46"}

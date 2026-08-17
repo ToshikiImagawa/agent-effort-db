@@ -19,7 +19,11 @@ from typing import Any
 
 DEFAULT_LIMIT = 50
 
-_JSON_FIELDS = "number,additions,deletions,changedFiles,createdAt,mergedAt,labels,reviews"
+# headRefName は突き合わせの主軸（(repo, branch) の一致）に使うため必須。
+# これが無いとセッションと PR を結び付ける手段が無くなる。
+_JSON_FIELDS = (
+    "number,headRefName,additions,deletions,changedFiles,createdAt,mergedAt,labels,reviews"
+)
 
 _AUTH_HINT = (
     "gh の active account が意図したアカウントか確認してください"
@@ -51,6 +55,7 @@ class PullRequestRow:
 
     repo: str
     pr_number: int
+    head_branch: str | None
     additions: int
     deletions: int
     changed_files: int
@@ -137,9 +142,13 @@ def _parse_pr_list(stdout: str) -> list[dict[str, Any]]:
 
 
 def _to_row(repo: str, pr: dict[str, Any]) -> PullRequestRow:
+    head_branch = pr.get("headRefName")
     return PullRequestRow(
         repo=repo,
         pr_number=int(pr["number"]),
+        # 空文字は「取れなかった」と同じ扱いにする。突き合わせで空文字同士が
+        # 一致してしまうと、無関係なセッションと PR が結び付く。
+        head_branch=head_branch if isinstance(head_branch, str) and head_branch else None,
         additions=int(pr.get("additions") or 0),
         deletions=int(pr.get("deletions") or 0),
         changed_files=int(pr.get("changedFiles") or 0),
@@ -170,23 +179,26 @@ def upsert_pull_requests(conn: sqlite3.Connection, rows: Sequence[PullRequestRow
     conn.executemany(
         """
         INSERT INTO pull_requests (
-          repo, pr_number, additions, deletions, changed_files,
-          review_rounds, created_at, merged_at, labels
+          repo, pr_number, head_branch, additions, deletions, changed_files,
+          review_rounds, created_at, merged_at, labels, collected_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
         ON CONFLICT (repo, pr_number) DO UPDATE SET
+          head_branch   = excluded.head_branch,
           additions     = excluded.additions,
           deletions     = excluded.deletions,
           changed_files = excluded.changed_files,
           review_rounds = excluded.review_rounds,
           created_at    = excluded.created_at,
           merged_at     = excluded.merged_at,
-          labels        = excluded.labels
+          labels        = excluded.labels,
+          collected_at  = datetime('now')
         """,
         [
             (
                 row.repo,
                 row.pr_number,
+                row.head_branch,
                 row.additions,
                 row.deletions,
                 row.changed_files,

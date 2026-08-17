@@ -7,8 +7,11 @@ from typer.testing import CliRunner
 
 from effort_db import config
 from effort_db.cli import app
+from effort_db.collectors import session
 
 runner = CliRunner()
+
+FIXTURES_DIR = Path(__file__).parent / "fixtures" / "projects"
 
 
 def test_init_creates_db(tmp_path: Path, monkeypatch) -> None:
@@ -58,17 +61,8 @@ def test_init_is_idempotent(tmp_path: Path, monkeypatch) -> None:
         conn.close()
 
 
-def test_unimplemented_commands_report_status(tmp_path: Path, monkeypatch) -> None:
-    monkeypatch.setenv(config.ENV_DB_PATH, str(tmp_path / "effort.db"))
-
-    result = runner.invoke(app, ["query", "SELECT 1"])
-
-    assert result.exit_code == 1
-    assert "未実装" in result.output
-
-
 def _init_db(tmp_path: Path, monkeypatch, *, with_patterns: bool = True) -> Path:
-    """stats / relink 用にDBを用意する。config.toml は tmp 側に隔離する。
+    """stats / link / query 用にDBを用意する。config.toml は tmp 側に隔離する。
 
     実装は既定パターンを持たないため、既定では架空のパターンを設定して起動する。
     """
@@ -85,13 +79,13 @@ def _init_db(tmp_path: Path, monkeypatch, *, with_patterns: bool = True) -> Path
     return db_path
 
 
-def test_stats_on_empty_db_shows_zero_percent(tmp_path: Path, monkeypatch) -> None:
+def test_stats_on_empty_db_shows_zero_without_warnings(tmp_path: Path, monkeypatch) -> None:
     _init_db(tmp_path, monkeypatch)
 
     result = runner.invoke(app, ["stats"])
 
     assert result.exit_code == 0
-    assert "0 行, issue_key 有り 0 行 (0.0%)" in result.output
+    assert "sessions      : 0 行" in result.output
     assert "[警告]" not in result.output
 
 
@@ -105,32 +99,34 @@ def test_stats_warns_when_patterns_are_not_configured(tmp_path: Path, monkeypatc
     assert config.CONFIG_KEY_ISSUE_KEY_PATTERNS in result.output
 
 
-def test_stats_reports_join_rate_and_warns_when_low(tmp_path: Path, monkeypatch) -> None:
+def test_stats_reports_join_rate_per_source_and_warns_when_low(tmp_path: Path, monkeypatch) -> None:
     db_path = _init_db(tmp_path, monkeypatch)
     conn = sqlite3.connect(db_path)
     try:
         conn.executemany(
-            "INSERT INTO sessions (session_id, branch, issue_key) VALUES (?, ?, ?)",
+            "INSERT INTO sessions (session_id, repo, branch) VALUES (?, ?, ?)",
             [
-                ("s-1", "feat/SAMPLE-1", "SAMPLE-1"),
-                ("s-2", "feat/no-key", None),
-                ("s-3", None, None),
+                ("s-1", "example/repo", "feat/SAMPLE-1"),
+                ("s-2", "example/repo", "feat/no-pr"),
+                ("s-3", "example/repo", None),
             ],
         )
         conn.execute(
-            "INSERT INTO pull_requests (repo, pr_number, issue_key) VALUES (?, ?, ?)",
-            ("example/repo", 1, "SAMPLE-1"),
+            "INSERT INTO pull_requests (repo, pr_number, head_branch) VALUES (?, ?, ?)",
+            ("example/repo", 1, "feat/SAMPLE-1"),
         )
         conn.commit()
     finally:
         conn.close()
+    assert runner.invoke(app, ["link"]).exit_code == 0
 
     result = runner.invoke(app, ["stats"])
 
     assert result.exit_code == 0
-    assert "3 行, issue_key 有り 1 行 (33.3%)" in result.output
-    assert "join 済み     : 1 issue_key" in result.output
-    assert "[警告] sessions の issue_key 抽出率が低い" in result.output
+    assert "repo_branch   : 1 セッション (33.3%)" in result.output
+    assert "unlinked      : 2 セッション (66.7%)" in result.output
+    assert "[警告] PR 収集済みリポジトリでの join 率が低い" in result.output
+    assert "[情報] repo または branch が欠けたセッションが 1 行ある" in result.output
 
 
 def test_stats_without_init_reports_guidance(tmp_path: Path, monkeypatch) -> None:
@@ -143,44 +139,138 @@ def test_stats_without_init_reports_guidance(tmp_path: Path, monkeypatch) -> Non
     assert "effort-db init" in result.output
 
 
-def test_relink_fills_issue_key_from_branch(tmp_path: Path, monkeypatch) -> None:
+def test_link_creates_links_and_assigns_issue_keys(tmp_path: Path, monkeypatch) -> None:
     db_path = _init_db(tmp_path, monkeypatch)
     conn = sqlite3.connect(db_path)
     try:
         conn.executemany(
-            "INSERT INTO sessions (session_id, branch) VALUES (?, ?)",
-            [("s-1", "feat/SAMPLE-1-add"), ("s-2", None)],
+            "INSERT INTO sessions (session_id, repo, branch) VALUES (?, ?, ?)",
+            [("s-1", "example/repo", "feat/SAMPLE-1-add"), ("s-2", "example/repo", None)],
+        )
+        conn.execute(
+            "INSERT INTO pull_requests (repo, pr_number, head_branch) VALUES (?, ?, ?)",
+            ("example/repo", 3, "feat/SAMPLE-1-add"),
         )
         conn.commit()
     finally:
         conn.close()
 
-    result = runner.invoke(app, ["relink"])
+    result = runner.invoke(app, ["link"])
 
     assert result.exit_code == 0
+    assert "repo_branch   : 1 件のリンクを追加" in result.output
+    assert "unlinked      : 1 セッション" in result.output
     conn = sqlite3.connect(db_path)
     try:
+        assert conn.execute(
+            "SELECT session_id, pr_number, link_source FROM session_pr_links"
+        ).fetchall() == [("s-1", 3, "repo_branch")]
         rows = dict(conn.execute("SELECT session_id, issue_key FROM sessions").fetchall())
         assert rows == {"s-1": "SAMPLE-1", "s-2": None}
     finally:
         conn.close()
 
 
-def test_relink_without_patterns_does_nothing(tmp_path: Path, monkeypatch) -> None:
+def test_link_without_patterns_still_links_but_warns(tmp_path: Path, monkeypatch) -> None:
+    """チケットキーの設定が無くても (repo, branch) での突き合わせは成立する。"""
     db_path = _init_db(tmp_path, monkeypatch, with_patterns=False)
     conn = sqlite3.connect(db_path)
     try:
-        conn.execute("INSERT INTO sessions (session_id, branch) VALUES ('s-1', 'feat/SAMPLE-1')")
+        conn.execute(
+            "INSERT INTO sessions (session_id, repo, branch)"
+            " VALUES ('s-1', 'example/repo', 'feat/SAMPLE-1')"
+        )
+        conn.execute(
+            "INSERT INTO pull_requests (repo, pr_number, head_branch)"
+            " VALUES ('example/repo', 1, 'feat/SAMPLE-1')"
+        )
         conn.commit()
     finally:
         conn.close()
 
-    result = runner.invoke(app, ["relink"])
+    result = runner.invoke(app, ["link"])
 
     assert result.exit_code == 0
     assert config.CONFIG_KEY_ISSUE_KEY_PATTERNS in result.output
     conn = sqlite3.connect(db_path)
     try:
+        assert conn.execute("SELECT COUNT(*) FROM session_pr_links").fetchone() == (1,)
         assert conn.execute("SELECT issue_key FROM sessions").fetchone() == (None,)
     finally:
         conn.close()
+
+
+def test_log_reference_wins_over_branch_match_end_to_end(tmp_path: Path, monkeypatch) -> None:
+    """収集 → 突き合わせ → 参照が通しで動き、確実な由来が優先されることを確認する。"""
+    db_path = _init_db(tmp_path, monkeypatch)
+    monkeypatch.setattr(session, "DEFAULT_PROJECTS_DIR", FIXTURES_DIR)
+    assert runner.invoke(app, ["backfill", "sessions"]).exit_code == 0
+
+    conn = sqlite3.connect(db_path)
+    try:
+        # ログが PR 42 を参照しているセッションのブランチに一致する別の PR を置く。
+        conn.execute(
+            "INSERT INTO pull_requests (repo, pr_number, head_branch)"
+            " VALUES ('acme/widget', 99, 'feat/pr-ref')"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    assert runner.invoke(app, ["link"]).exit_code == 0
+    result = runner.invoke(
+        app,
+        [
+            "query",
+            "SELECT pr_number, link_source FROM session_pr_links"
+            " WHERE session_id = '99999999-9999-9999-9999-999999999999'",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "42\tlog_reference" in result.output
+    assert "99\trepo_branch" not in result.output
+
+
+def test_query_prints_header_and_rows(tmp_path: Path, monkeypatch) -> None:
+    db_path = _init_db(tmp_path, monkeypatch)
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "INSERT INTO sessions (session_id, repo, branch, turns)"
+            " VALUES ('s-1', 'example/repo', 'feat/x', 4)"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    result = runner.invoke(app, ["query", "SELECT session_id, turns, tool_calls FROM sessions"])
+
+    assert result.exit_code == 0
+    assert "session_id\tturns\ttool_calls" in result.output
+    # NULL を空文字にしない（0 と観測できなかったことを区別する）
+    assert "s-1\t4\tNULL" in result.output
+
+
+def test_query_rejects_writes(tmp_path: Path, monkeypatch) -> None:
+    db_path = _init_db(tmp_path, monkeypatch)
+
+    result = runner.invoke(app, ["query", "DELETE FROM sessions"])
+
+    assert result.exit_code == 1
+    assert "SQL エラー" in result.output
+    conn = sqlite3.connect(db_path)
+    try:
+        # 参照の逃げ道で raw 層を壊せない（A-002）
+        assert conn.execute("SELECT COUNT(*) FROM sessions").fetchone() == (0,)
+    finally:
+        conn.close()
+
+
+def test_query_reports_sql_errors_without_traceback(tmp_path: Path, monkeypatch) -> None:
+    _init_db(tmp_path, monkeypatch)
+
+    result = runner.invoke(app, ["query", "SELECT * FROM no_such_table"])
+
+    assert result.exit_code == 1
+    assert "SQL エラー" in result.output
