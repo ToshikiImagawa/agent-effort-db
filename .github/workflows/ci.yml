@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [ main ]
+
+# PR を更新したときに古いジョブを打ち切る。同じコミットを二重に検査しない。
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: uv をセットアップする
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      # --locked を付けるのは、CI が uv.lock を勝手に更新して
+      # 「ローカルと違う依存で緑になる」状態を防ぐため。
+      - name: 依存を同期する
+        run: uv sync --locked
+
+      - name: lint
+        run: uv run ruff check .
+
+      - name: format 検査
+        run: uv run ruff format --check .
+
+      - name: 型検査
+        run: uv run mypy src
+
+      # 実セッションログには触らない。テストは tests/fixtures の合成データのみを使う。
+      - name: テスト
+        run: uv run pytest -q
