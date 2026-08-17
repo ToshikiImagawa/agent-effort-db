@@ -8,18 +8,12 @@ import sqlite3
 import typer
 
 from effort_db import config, linker, schema
+from effort_db import stats as stats_module
 from effort_db.collectors import github, session
 
 app = typer.Typer(help="Claude Code / AIエージェントの実工数を収集・蓄積するCLI")
-backfill_app = typer.Typer(help="過去データの一括取り込み（未実装）")
+backfill_app = typer.Typer(help="過去データの一括取り込み")
 app.add_typer(backfill_app, name="backfill")
-
-_NOT_IMPLEMENTED_MESSAGE = "未実装: {name} は別issueで実装予定です。"
-
-
-def _not_implemented(name: str) -> None:
-    typer.echo(_NOT_IMPLEMENTED_MESSAGE.format(name=name), err=True)
-    raise typer.Exit(code=1)
 
 
 @app.command()
@@ -122,88 +116,133 @@ def _resolve_patterns_or_exit() -> list[re.Pattern[str]]:
 
 
 @app.command()
-def stats() -> None:
-    """issue_key の抽出率とjoin率を表示する（読み取り専用）。"""
+def link() -> None:
+    """セッションと PR の突き合わせを段階適用する（冪等）。
+
+    収集とは独立したコマンドにしてある。PR を後から取り込んだ場合に、
+    セッションを再収集せずにリンクだけを作り直せるようにするため。
+    """
     patterns = _resolve_patterns_or_exit()
     conn = _connect_initialized_db()
     try:
-        link_stats = linker.collect_link_stats(conn)
+        result = linker.resolve_links(conn, patterns=patterns)
     finally:
         conn.close()
 
-    typer.echo(
-        f"sessions      : {_format_linked(link_stats.sessions_linked, link_stats.sessions_total)}"
-    )
-    typer.echo(f"pull_requests : {_format_linked(link_stats.prs_linked, link_stats.prs_total)}")
-    typer.echo(f"task_effort   : {link_stats.task_effort_keys} issue_key")
-    typer.echo(f"join 済み     : {link_stats.joined_keys} issue_key (sessions と PR の両方に存在)")
-    typer.echo(f"sessions のみ : {link_stats.sessions_only_keys} issue_key")
-    typer.echo(f"PR のみ       : {link_stats.prs_only_keys} issue_key")
-
-    for warning in _link_warnings(link_stats, patterns_configured=bool(patterns)):
-        typer.echo(warning)
+    for source, count in result.linked_by_source.items():
+        typer.echo(f"{source.value:<14}: {count} 件のリンクを追加")
+    typer.echo(f"issue_key     : {result.issue_keys_assigned} 行に付与")
+    typer.echo(f"unlinked      : {result.unlinked_sessions} セッション")
+    if not patterns:
+        typer.echo(_no_patterns_warning())
 
 
 @app.command()
-def relink() -> None:
-    """既存 sessions の issue_key を branch から再計算する（冪等）。"""
+def stats() -> None:
+    """収集件数・由来ごとの join 率・未紐付け件数を表示する（読み取り専用）。"""
     patterns = _resolve_patterns_or_exit()
-    if not patterns:
-        typer.echo(
-            f"config.toml の {config.CONFIG_KEY_ISSUE_KEY_PATTERNS} が未設定のため何もしない。"
-        )
-        return
-
     conn = _connect_initialized_db()
     try:
-        result = linker.relink_sessions(conn, patterns=patterns)
+        collected = stats_module.collect_stats(conn)
     finally:
         conn.close()
+
+    typer.echo(f"sessions      : {collected.sessions} 行")
     typer.echo(
-        f"relink: {result.scanned} 行を走査, {result.updated} 行を更新, "
-        f"{result.unlinked} 行が unlinked (issue_key IS NULL)"
+        f"pull_requests : {collected.pull_requests} 行"
+        f" (head_branch 有り {collected.prs_with_head_branch} 行)"
+    )
+    typer.echo("join 率（由来ごと。分母は sessions 総数）:")
+    for source, rate in collected.join_rate_by_source.items():
+        count = (
+            collected.unlinked_sessions
+            if source is linker.LinkSource.UNLINKED
+            else collected.linked_sessions_by_source.get(source, 0)
+        )
+        typer.echo(f"  {source.value:<14}: {count} セッション ({rate:.1f}%)")
+    typer.echo(
+        f"PR 収集済みリポジトリに限った join 率: {collected.focused_join_rate:.1f}%"
+        f" ({collected.linked_sessions_in_repos_with_prs}/{collected.sessions_in_repos_with_prs})"
+    )
+    typer.echo(
+        f"issue_key     : sessions {collected.sessions_with_issue_key} 行"
+        f" ({collected.sessions_issue_key_rate:.1f}%) / PR {collected.prs_with_issue_key} 行"
+        f" ({collected.prs_issue_key_rate:.1f}%) / {collected.issue_keys} 種類"
+    )
+
+    for warning in _stats_warnings(collected, patterns_configured=bool(patterns)):
+        typer.echo(warning)
+
+
+def _no_patterns_warning() -> str:
+    return (
+        f"[警告] config.toml の {config.CONFIG_KEY_ISSUE_KEY_PATTERNS} が未設定のため "
+        "issue_key は付与されない（既定パターンは持たない）。"
     )
 
 
-def _format_linked(linked: int, total: int) -> str:
-    rate = 0.0 if total == 0 else linked / total * 100
-    return f"{total} 行, issue_key 有り {linked} 行 ({rate:.1f}%)"
+def _stats_warnings(collected: stats_module.Stats, *, patterns_configured: bool) -> list[str]:
+    """join 率が低いことを見落とさないよう、閾値割れと構造的な原因を明示する行を返す。
 
-
-def _link_warnings(link_stats: linker.LinkStats, *, patterns_configured: bool) -> list[str]:
-    """join率が低いことを見落とさないよう、閾値割れを明示する行を返す。
-
-    0 行のときは警告しない（空DBに命名規約の見直しを促しても判断材料にならない）。
-    パターン未設定時は抽出率の低さを重ねて警告しない（原因が設定未了と特定できており、
-    命名規約の見直しを促すのは誤誘導になる）。
+    0 行のときは警告しない（空DBに見直しを促しても判断材料にならない）。
+    原因が特定できる場合は率の低さを重ねて警告しない（誤誘導になる）。
     """
     warnings: list[str] = []
-    threshold = linker.LOW_LINK_RATE_THRESHOLD
+    threshold = stats_module.LOW_LINK_RATE_THRESHOLD
+    # パターン未設定は収集内容によらない設定の問題なので、空DBでも伝える。
     if not patterns_configured:
-        return [
-            f"[警告] config.toml の {config.CONFIG_KEY_ISSUE_KEY_PATTERNS} が未設定のため "
-            "issue_key は付与されない（既定パターンは持たない）。"
-        ]
-    if link_stats.sessions_total > 0 and link_stats.sessions_link_rate < threshold:
+        warnings.append(_no_patterns_warning())
+    if collected.sessions == 0:
+        return warnings
+    if collected.pull_requests == 0:
         warnings.append(
-            f"[警告] sessions の issue_key 抽出率が低い ({link_stats.sessions_link_rate:.1f}% "
-            f"< {threshold:.0f}%)。ブランチ命名規約か config.toml の "
-            f"{config.CONFIG_KEY_ISSUE_KEY_PATTERNS} を見直すこと。"
+            "[警告] PR が 1 件も収集されていないため (repo, branch) では紐付かない。"
+            "先に effort-db backfill prs --repo <owner/repo> を実行すること。"
         )
-    if link_stats.prs_total > 0 and link_stats.prs_link_rate < threshold:
+    elif collected.focused_join_rate < threshold:
         warnings.append(
-            f"[警告] pull_requests の issue_key 抽出率が低い ({link_stats.prs_link_rate:.1f}% "
-            f"< {threshold:.0f}%)。"
+            f"[警告] PR 収集済みリポジトリでの join 率が低い "
+            f"({collected.focused_join_rate:.1f}% < {threshold:.0f}%)。"
+            "ブランチ命名規約か PR の収集範囲（--limit / 対象リポジトリ）を見直すこと。"
         )
-    if link_stats.joined_keys == 0 and (link_stats.sessions_linked or link_stats.prs_linked):
+    if collected.sessions_without_repo_or_branch:
         warnings.append(
-            "[警告] join が 1 件も成立していない。sessions と PR で issue_key の表記が"
-            "揃っているか確認すること。"
+            f"[情報] repo または branch が欠けたセッションが "
+            f"{collected.sessions_without_repo_or_branch} 行ある。"
+            "これらは (repo, branch) では構造的に紐付けられない。"
+        )
+    if collected.links_with_unknown_source:
+        warnings.append(
+            f"[警告] 未知の由来を持つリンクが {collected.links_with_unknown_source} 行ある。"
+            "新しいバージョンで書かれた DB の可能性がある（内訳が全体と合わない）。"
         )
     return warnings
 
 
 @app.command()
 def query(sql: str) -> None:
-    """素のSQL逃げ道（未実装）。"""
-    _not_implemented("query")
+    """任意の SQL で参照する（読み取り専用）。
+
+    書き込みを許さないのは、逃げ道としての SQL 実行で収集済みデータを壊せる状態に
+    しないため（raw 層を失わない: A-002）。書き換えが必要なら sqlite3 を直接使う。
+    """
+    conn = _connect_initialized_db()
+    try:
+        conn.execute("PRAGMA query_only = ON")
+        try:
+            cursor = conn.execute(sql)
+        except sqlite3.Error as exc:
+            typer.echo(f"SQL エラー: {exc}", err=True)
+            raise typer.Exit(code=1) from exc
+        if cursor.description is None:
+            return
+        typer.echo("\t".join(column[0] for column in cursor.description))
+        for row in cursor:
+            typer.echo("\t".join(_format_cell(value) for value in row))
+    finally:
+        conn.close()
+
+
+def _format_cell(value: object) -> str:
+    """NULL を空文字にしない。0 と NULL の区別が出力でも失われないようにする。"""
+    return "NULL" if value is None else str(value)

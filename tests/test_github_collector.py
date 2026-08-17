@@ -4,6 +4,7 @@ import json
 import sqlite3
 import subprocess
 from collections.abc import Sequence
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -26,6 +27,7 @@ SAMPLE_GH_OUTPUT = json.dumps(
     [
         {
             "number": 12,
+            "headRefName": "feat/sample-a",
             "additions": 120,
             "deletions": 30,
             "changedFiles": 4,
@@ -81,6 +83,9 @@ def test_fetch_merged_prs_builds_rows() -> None:
     assert (first.additions, first.deletions, first.changed_files) == (120, 30, 4)
     assert first.created_at == "2026-01-05T01:00:00Z"
     assert first.merged_at == "2026-01-06T02:00:00Z"
+    assert first.head_branch == "feat/sample-a"
+    # headRefName を持たない出力では None にする。空文字だと突き合わせで誤って一致する。
+    assert rows[1].head_branch is None
     assert json.loads(first.labels) == ["enhancement", "収集"]
     # CHANGES_REQUESTED のみ数えるので 2。APPROVED / COMMENTED は数えない。
     assert first.review_rounds == 2
@@ -88,6 +93,8 @@ def test_fetch_merged_prs_builds_rows() -> None:
     assert json.loads(rows[1].labels) == []
 
     args = calls[0]
+    # headRefName は突き合わせの主軸。取得列から落ちると join できなくなる。
+    assert "headRefName" in args[args.index("--json") + 1]
     assert "--repo" in args and "acme/sample" in args
     assert "--state" in args and "merged" in args
     assert args[args.index("--limit") + 1] == "10"
@@ -159,16 +166,11 @@ def test_upsert_is_idempotent_and_updates_values(tmp_path: Path) -> None:
         conn.commit()
 
         updated = [
-            github.PullRequestRow(
-                repo=rows[0].repo,
-                pr_number=rows[0].pr_number,
-                additions=rows[0].additions,
-                deletions=rows[0].deletions,
-                changed_files=rows[0].changed_files,
+            replace(
+                rows[0],
                 review_rounds=3,
-                created_at=rows[0].created_at,
                 merged_at="2026-01-08T09:00:00Z",
-                labels=rows[0].labels,
+                head_branch="feat/sample-a-renamed",
             ),
             rows[1],
         ]
@@ -176,10 +178,10 @@ def test_upsert_is_idempotent_and_updates_values(tmp_path: Path) -> None:
 
         assert conn.execute("SELECT COUNT(*) FROM pull_requests").fetchone() == (2,)
         assert conn.execute(
-            "SELECT merged_at, review_rounds, issue_key FROM pull_requests"
+            "SELECT merged_at, review_rounds, head_branch, issue_key FROM pull_requests"
             " WHERE repo = ? AND pr_number = ?",
             ("acme/sample", 12),
-        ).fetchone() == ("2026-01-08T09:00:00Z", 3, "SAMPLE-1")
+        ).fetchone() == ("2026-01-08T09:00:00Z", 3, "feat/sample-a-renamed", "SAMPLE-1")
     finally:
         conn.close()
 

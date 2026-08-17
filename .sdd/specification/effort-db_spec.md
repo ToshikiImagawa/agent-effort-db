@@ -5,7 +5,7 @@ type: "spec"
 status: "draft"
 sdd-phase: "specify"
 created: "2026-08-16"
-updated: "2026-08-16"
+updated: "2026-08-17"
 depends-on: [ "prd-effort-db" ]
 tags: [ "effort-tracking", "cli", "sqlite", "estimation", "session-log" ]
 category: "core"
@@ -81,7 +81,7 @@ GitHub の PR の経過時間はレビュー待ち・放置を含みノイジー
 | FR-003 | セッションのターン数を計上できる。ターンは人由来の発話回数を指し、ツール応答を含まない               | 必須  | FR_002_01         |
 | FR-004 | セッションのツール呼び出し回数を計上できる。主エージェントとサブエージェントの回数を区別して保持する         | 必須  | FR_002_02         |
 | FR-005 | セッションの実経過時間を算出できる                                         | 必須  | FR_002_03         |
-| FR-006 | セッションのトークン使用量（入力・出力・キャッシュ読み取り）を計上できる                       | 必須  | FR_002_04         |
+| FR-006 | セッションのトークン使用量（入力・出力・キャッシュ読み取り・キャッシュ作成）を、主エージェントとサブエージェントを区別して計上できる | 必須  | FR_002_04         |
 | FR-007 | セッション本体のログのみを収集対象とし、サブエージェント transcript や workflow ジャーナルをセッションとして扱わない | 必須  | FR_002            |
 | FR-008 | 対象リポジトリの PR メタ情報を取り込める                                    | 必須  | FR_003            |
 | FR-009 | セッション識別子を指定して 1 件だけ取り込める。結果は一括取り込みと一致する                    | 必須  | FR_004            |
@@ -116,17 +116,20 @@ GitHub の PR の経過時間はレビュー待ち・放置を含みノイジー
 | pkg                       | class                | member                                      | 概要                                              |
 |:--------------------------|:---------------------|:--------------------------------------------|:------------------------------------------------|
 | `effort_db`               | `config`             | `resolve_db_path() -> Path`                 | DB パスを環境変数 > 設定ファイル > デフォルトの順で解決する（FR-021）      |
-| `effort_db`               | `config`             | `load_config() -> Config`                   | 設定（チケットキー形式、対象リポジトリ等）を読み込む（FR-021）              |
-| `effort_db`               | `schema`             | `connect(db_path) -> Connection`            | DB への接続を取得する。永続化技術は design が定める                  |
-| `effort_db`               | `schema`             | `init_db(conn) -> None`                     | テーブル・ビューを冪等に作成する（FR-001）                        |
+| `effort_db`               | `config`             | `load_issue_key_patterns() -> list[str] \| None` | チケットキーの抽出パターンを読み込む。未設定なら `None`（FR-021）           |
+| `effort_db`               | `schema`             | `init_db(conn) -> None`                     | テーブル・ビューを冪等に作成し、必要ならマイグレーションを適用する（FR-001）          |
+| `effort_db`               | `schema`             | `migrate(conn) -> None`                     | 現在のスキーマバージョンから最新まで順次適用する                        |
 | `effort_db`               | `schema`             | `SCHEMA_VERSION`                            | スキーマバージョン                                       |
 | `effort_db.collectors`    | `session`            | `iter_session_files(root) -> Iterator[Path]`  | セッション本体のログを列挙する（FR-002 / FR-007）                    |
 | `effort_db.collectors`    | `session`            | `parse_session_file(path) -> SessionRecord` | 1 ファイルから実測値を導出する（FR-003〜FR-006）                  |
-| `effort_db.collectors`    | `session`            | `collect_all(conn, root) -> CollectResult`   | セッションを DB へ収束保存する（FR-002 / FR-019）               |
-| `effort_db.collectors`    | `github`             | `fetch_pull_requests(repo) -> list[PullRequestRecord]` | PR メタ情報を取得する（FR-008）                            |
-| `effort_db.collectors`    | `github`             | `collect_pull_requests(conn, repo) -> CollectResult` | PR を DB へ収束保存する（FR-008 / FR-019）                 |
+| `effort_db.collectors`    | `session`            | `collect_all(conn, root) -> CollectResult`    | セッションを DB へ収束保存する（FR-002 / FR-019）               |
+| `effort_db.collectors`    | `session`            | `collect_one(conn, session_id) -> bool`     | 単一セッションを収束保存する。対象が無ければ `False`（FR-009）            |
+| `effort_db.collectors`    | `github`             | `fetch_merged_prs(repo, limit) -> list[PullRequestRecord]` | マージ済み PR のメタ情報を取得する（FR-008）                      |
+| `effort_db.collectors`    | `github`             | `upsert_pull_requests(conn, rows) -> int`   | PR を DB へ収束保存する（FR-008 / FR-019）                 |
 | `effort_db`               | `linker`             | `extract_issue_key(text, patterns) -> str \| None` | 文字列からチケットキーを抽出する（FR-012）                        |
+| `effort_db`               | `linker`             | `resolve_patterns() -> list[Pattern]`       | 設定のパターンをコンパイルする。未設定なら空（FR-021 / B-004）           |
 | `effort_db`               | `linker`             | `resolve_links(conn, patterns) -> LinkResult` | 突き合わせを段階適用し、由来付きでリンクを保存する（FR-010〜FR-014）        |
+| `effort_db`               | `linker`             | `assign_issue_keys(conn, patterns) -> int`   | チケットキーを付与する。リンクの成否とは独立に実行できる（FR-012）            |
 | `effort_db`               | `stats`              | `collect_stats(conn) -> Stats`              | 収集件数・キー種別ごとの join 率・未紐付け件数を算出する（FR-015）         |
 
 ## 4.1. 型定義
@@ -163,14 +166,21 @@ class SessionRecord:
     started_at: datetime | None
     ended_at: datetime | None
     wall_clock_min: float | None     # FR-005
-    turns: int                       # 人由来の発話回数。ツール応答を含まない（FR-003）
-    tool_calls: int                  # 主エージェントのツール呼び出し回数（FR-004）
-    sidechain_tool_calls: int        # サブエージェントのツール呼び出し回数（FR-004）
-    input_tokens: int                # FR-006
-    output_tokens: int               # FR-006
-    cache_read_tokens: int           # FR-006
+    # 件数・トークンは「観測できなかった」ことを None で表す。0 で埋めない
+    turns: int | None                # 人由来の発話回数。ツール応答を含まない（FR-003）
+    tool_calls: int | None           # 主エージェントのツール呼び出し回数（FR-004）
+    sidechain_tool_calls: int | None # サブエージェントのツール呼び出し回数（FR-004）
+    input_tokens: int | None                  # 主エージェント分（FR-006）
+    output_tokens: int | None                 # FR-006
+    cache_read_tokens: int | None             # FR-006
+    cache_creation_tokens: int | None          # FR-006
+    sidechain_input_tokens: int | None         # サブエージェント分（FR-006）
+    sidechain_output_tokens: int | None        # FR-006
+    sidechain_cache_read_tokens: int | None    # FR-006
+    sidechain_cache_creation_tokens: int | None # FR-006
     log_versions: tuple[str, ...]    # 観測されたログ形式バージョン（NFR-004）
     interrupted: bool                # 中断の有無。構造フィールドとテキストマーカーの両方で判定する
+    pr_refs: tuple["SessionPullRequestRef", ...]  # ログ内の PR 参照（FR-011）
     skipped_records: int             # 解釈できずスキップしたレコード数（NFR-003）
 
 
@@ -222,23 +232,44 @@ class CollectResult:
 
 @dataclass(frozen=True)
 class LinkResult:
-    """突き合わせの結果。由来ごとの件数を保持する（FR-015）。"""
+    """突き合わせの結果。由来ごとの件数を保持する（FR-015）。
+
+    件数は「今回新しく作られたリンク」を表す。冪等なので 2 回目の実行では 0 になる。
+    """
 
     linked_by_source: dict[LinkSource, int]
     unlinked_sessions: int
+    issue_keys_assigned: int
 
 
 @dataclass(frozen=True)
 class Stats:
-    """収集の健全性。join 率はキー種別ごとに区別する（FR-015）。"""
+    """収集の健全性。join 率はキー種別ごとに区別する（FR-015）。
+
+    リンク行数（`links_by_source`）と紐付いたセッション数（`linked_sessions_by_source`）を
+    分けて持つ。1 セッションが複数 PR に紐づくと両者は一致せず、率はセッション数で出す。
+    """
 
     sessions: int
     pull_requests: int
+    prs_with_head_branch: int
     links_by_source: dict[LinkSource, int]
-    join_rate_by_source: dict[LinkSource, float]
+    linked_sessions_by_source: dict[LinkSource, int]
+    links_with_unknown_source: int
     unlinked_sessions: int
+    sessions_without_repo_or_branch: int
+    sessions_in_repos_with_prs: int
+    linked_sessions_in_repos_with_prs: int
     sessions_with_issue_key: int
+    prs_with_issue_key: int
+    issue_keys: int
+    # 率は 0 件でも落ちないよう算出側に持たせる:
+    # join_rate_by_source / focused_join_rate / sessions_issue_key_rate / prs_issue_key_rate
 ```
+
+`focused_join_rate` は **PR を収集済みのリポジトリに属するセッションだけを分母にした
+join 率**である。PR を取り込んでいないリポジトリのセッションは構造的に紐付けられないため、
+全体の率だけを見ると突き合わせの不備と PR 未収集を区別できない。
 
 ## 4.2. 集約層
 
@@ -253,7 +284,8 @@ class Stats:
 | `total_tool_calls`           | 主エージェントのツール呼び出し数                      |
 | `total_sidechain_tool_calls` | サブエージェントのツール呼び出し数                     |
 | `total_min`                  | 総実経過時間                                |
-| `total_input_tokens` / `total_output_tokens` / `total_cache_read_tokens` | トークン使用量        |
+| `total_input_tokens` / `total_output_tokens` / `total_cache_read_tokens` / `total_cache_creation_tokens` | 主エージェントのトークン使用量 |
+| `total_sidechain_input_tokens` ほか同 4 種 | サブエージェントのトークン使用量                       |
 | `linked_prs`                 | 突き合わせられた PR の数                        |
 | `diff_size`                  | 対応する PR の差分規模の合計                       |
 
@@ -269,12 +301,12 @@ class Stats:
 
 | 用語               | 説明                                                            |
 |:-----------------|:--------------------------------------------------------------|
-| セッション            | エージェントとの 1 回の対話単位。1 つのセッション識別子で識別される。ログファイルと 1:1 に対応しない場合がある   |
+| セッション            | エージェントとの 1 回の対話単位。1 つのセッション識別子で識別される。セッション本体のログファイルと 1:1 に対応する（design O4 / D4） |
 | ターン              | 人由来の発話回数。ツール実行結果の返却は含まない                                      |
 | ツール呼び出し          | エージェントがツールを実行した回数。主エージェントとサブエージェントを区別して保持する                    |
 | サブエージェント         | 主エージェントから起動される下位のエージェント。その作業量は独立した観測量として保持する                  |
 | 実経過時間（wall clock） | セッションの開始から終了までの実時間                                            |
-| トークン使用量          | セッションで消費した入力・出力・キャッシュ読み取りトークン数                                |
+| トークン使用量          | セッションで消費した入力・出力・キャッシュ読み取り・キャッシュ作成のトークン数。主エージェントとサブエージェントを区別して保持する |
 | 突き合わせキー          | セッションと PR を同一の作業単位として結びつけるキー。リポジトリとブランチの組を主とし、ログ内 PR 参照・チケットキーを併用する。確実性の高い順に段階適用する |
 | 由来（`link_source`） | 突き合わせがどのキーによって成立したかを示す値。join 率をキー種別ごとに観測するために保持する             |
 | チケットキー（`issue_key`） | チケット単位の集約に用いる補助的なキー。単独の主キーとはしない                               |
@@ -293,7 +325,7 @@ class Stats:
 # DB を作成する（冪等）
 effort-db init
 
-# 過去のセッションログを一括取り込み
+# 過去のセッションログを一括取り込み（常に全走査。何度実行しても結果は収束する）
 effort-db backfill sessions
 
 # PR メタ情報を取り込み
@@ -317,12 +349,12 @@ effort-db query "SELECT * FROM effort_by_branch ORDER BY total_turns DESC LIMIT 
 点推定ではなく分布で扱う（B-003）。
 
 ```bash
-# ブランチあたりのターン数の中央値と p90 を求める
+# セッションあたりのターン数の中央値と p90 を求める
 effort-db query "
   SELECT COUNT(*)                                          AS samples,
          AVG(turns)                                         AS mean_turns,
-         MAX(CASE WHEN pct <= 0.5 THEN turns END)           AS median_turns,
-         MAX(CASE WHEN pct <= 0.9 THEN turns END)           AS p90_turns
+         MIN(CASE WHEN pct >= 0.5 THEN turns END)           AS median_turns,
+         MIN(CASE WHEN pct >= 0.9 THEN turns END)           AS p90_turns
   FROM (
     SELECT turns,
            CUME_DIST() OVER (ORDER BY turns) AS pct
@@ -332,20 +364,29 @@ effort-db query "
 "
 ```
 
+**分位点は「累積分布が p に達する最小の値」で求める**（`MIN(... >= p)`）。
+`MAX(... <= p)` としてはならない。実データではターン数 1 のセッションが過半（51.4%）を
+占めるため、最小値の累積分布が既に 0.5 を超え、`pct <= 0.5` を満たす行が 1 件も無くなって
+中央値が NULL になる（design O28）。同値が多い分布では前者だけが正しく動く。
+
 ## 6.3. Python API
 
 ```python
-from effort_db import config, linker, schema
+import sqlite3
+
+from effort_db import config, linker, schema, stats
 from effort_db.collectors import session
 
-conn = schema.connect(config.resolve_db_path())
+conn = sqlite3.connect(config.resolve_db_path())
 schema.init_db(conn)
 
 result = session.collect_all(conn)
 print(result.inserted, result.updated, result.skipped_records)
 
-link_result = linker.resolve_links(conn, config.load_config().issue_key_patterns)
+link_result = linker.resolve_links(conn, patterns=linker.resolve_patterns())
 print(link_result.linked_by_source, link_result.unlinked_sessions)
+
+print(stats.collect_stats(conn).join_rate_by_source)
 ```
 
 # 7. 振る舞い図

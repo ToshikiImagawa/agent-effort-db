@@ -13,6 +13,8 @@ TICKET_PATTERN = r"(?<![0-9A-Za-z])[A-Z][A-Z0-9]+-[0-9]+(?![0-9A-Za-z])"
 ISSUE_NUMBER_PATTERN = r"(?<![0-9A-Za-z])#[0-9]+(?![0-9A-Za-z])"
 PATTERNS = linker.compile_patterns([TICKET_PATTERN, ISSUE_NUMBER_PATTERN])
 
+REPO = "example/repo"
+
 
 def _open_db(tmp_path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(tmp_path / "effort.db")
@@ -25,20 +27,42 @@ def _insert_session(
     session_id: str,
     branch: str | None = None,
     issue_key: str | None = None,
+    repo: str | None = REPO,
 ) -> None:
     conn.execute(
-        "INSERT INTO sessions (session_id, branch, issue_key) VALUES (?, ?, ?)",
-        (session_id, branch, issue_key),
+        "INSERT INTO sessions (session_id, repo, branch, issue_key) VALUES (?, ?, ?, ?)",
+        (session_id, repo, branch, issue_key),
     )
     conn.commit()
 
 
-def _insert_pr(conn: sqlite3.Connection, pr_number: int, issue_key: str | None) -> None:
+def _insert_pr(
+    conn: sqlite3.Connection,
+    pr_number: int,
+    issue_key: str | None = None,
+    head_branch: str | None = None,
+    repo: str = REPO,
+) -> None:
     conn.execute(
-        "INSERT INTO pull_requests (repo, pr_number, issue_key) VALUES (?, ?, ?)",
-        ("example/repo", pr_number, issue_key),
+        "INSERT INTO pull_requests (repo, pr_number, head_branch, issue_key) VALUES (?, ?, ?, ?)",
+        (repo, pr_number, head_branch, issue_key),
     )
     conn.commit()
+
+
+def _insert_pr_ref(
+    conn: sqlite3.Connection, session_id: str, pr_number: int, repo: str = REPO
+) -> None:
+    conn.execute(
+        "INSERT INTO session_pr_refs (session_id, repo, pr_number) VALUES (?, ?, ?)",
+        (session_id, repo, pr_number),
+    )
+    conn.commit()
+
+
+def _links(conn: sqlite3.Connection) -> dict[tuple[str, int], str]:
+    rows = conn.execute("SELECT session_id, pr_number, link_source FROM session_pr_links")
+    return {(session_id, pr_number): source for session_id, pr_number, source in rows}
 
 
 def test_extracts_prefixed_ticket_key_from_branch() -> None:
@@ -111,19 +135,6 @@ def test_no_patterns_when_config_absent(tmp_path: Path) -> None:
     assert linker.extract_issue_key("feat/SAMPLE-1", patterns=patterns) is None
 
 
-def test_relink_with_no_patterns_keeps_all_rows_unlinked(tmp_path: Path) -> None:
-    conn = _open_db(tmp_path)
-    try:
-        _insert_session(conn, "s-1", branch="feat/SAMPLE-1-add")
-
-        result = linker.relink_sessions(conn, patterns=[])
-
-        assert result == linker.RelinkResult(scanned=1, updated=0, unlinked=1)
-        assert conn.execute("SELECT issue_key FROM sessions").fetchone() == (None,)
-    finally:
-        conn.close()
-
-
 def test_invalid_pattern_raises_value_error() -> None:
     with pytest.raises(ValueError):
         linker.compile_patterns(["SAMPLE-(["])
@@ -140,93 +151,182 @@ def test_non_list_patterns_in_config_raises_value_error(tmp_path: Path) -> None:
         linker.resolve_patterns(data_dir=data_dir)
 
 
-def test_relink_fills_issue_key_and_keeps_unlinked_rows(tmp_path: Path) -> None:
+def test_links_by_repo_and_branch(tmp_path: Path) -> None:
     conn = _open_db(tmp_path)
     try:
-        _insert_session(conn, "s-1", branch="feat/SAMPLE-1-add")
-        _insert_session(conn, "s-2", branch="feat/no-key")
-        _insert_session(conn, "s-3", branch=None)
+        _insert_session(conn, "s-1", branch="feat/x")
+        _insert_pr(conn, 1, head_branch="feat/x")
 
-        result = linker.relink_sessions(conn, patterns=PATTERNS)
+        result = linker.resolve_links(conn, patterns=[])
 
-        assert result == linker.RelinkResult(scanned=3, updated=1, unlinked=2)
-        rows = dict(conn.execute("SELECT session_id, issue_key FROM sessions").fetchall())
-        assert rows == {"s-1": "SAMPLE-1", "s-2": None, "s-3": None}
+        assert _links(conn) == {("s-1", 1): "repo_branch"}
+        assert result.linked_by_source[linker.LinkSource.REPO_BRANCH] == 1
+        assert result.unlinked_sessions == 0
     finally:
         conn.close()
 
 
-def test_relink_is_idempotent(tmp_path: Path) -> None:
+def test_does_not_link_across_repositories_with_the_same_branch_name(tmp_path: Path) -> None:
+    conn = _open_db(tmp_path)
+    try:
+        _insert_session(conn, "s-1", branch="feat/x", repo="example/other")
+        _insert_pr(conn, 1, head_branch="feat/x")
+
+        linker.resolve_links(conn, patterns=[])
+
+        assert _links(conn) == {}
+    finally:
+        conn.close()
+
+
+def test_log_reference_is_applied_even_when_the_pr_is_not_collected(tmp_path: Path) -> None:
+    """ログ内の PR 参照は PR を backfill したかに左右されない観測事実として扱う。"""
+    conn = _open_db(tmp_path)
+    try:
+        _insert_session(conn, "s-1", branch="feat/x")
+        _insert_pr_ref(conn, "s-1", 7)
+
+        linker.resolve_links(conn, patterns=[])
+
+        assert _links(conn) == {("s-1", 7): "log_reference"}
+    finally:
+        conn.close()
+
+
+def test_later_stage_does_not_overwrite_an_earlier_stage(tmp_path: Path) -> None:
+    """由来の確実性の順序を保つ。ログ参照が付いたセッションに repo_branch は付けない。"""
+    conn = _open_db(tmp_path)
+    try:
+        _insert_session(conn, "s-1", branch="feat/x")
+        _insert_pr_ref(conn, "s-1", 7)
+        _insert_pr(conn, 7, head_branch="feat/x")
+        _insert_pr(conn, 8, head_branch="feat/x")
+
+        result = linker.resolve_links(conn, patterns=[])
+
+        assert _links(conn) == {("s-1", 7): "log_reference"}
+        assert result.linked_by_source[linker.LinkSource.REPO_BRANCH] == 0
+    finally:
+        conn.close()
+
+
+def test_one_session_can_link_to_several_prs_by_branch(tmp_path: Path) -> None:
+    conn = _open_db(tmp_path)
+    try:
+        _insert_session(conn, "s-1", branch="feat/x")
+        _insert_pr(conn, 1, head_branch="feat/x")
+        _insert_pr(conn, 2, head_branch="feat/x")
+
+        linker.resolve_links(conn, patterns=[])
+
+        assert _links(conn) == {("s-1", 1): "repo_branch", ("s-1", 2): "repo_branch"}
+    finally:
+        conn.close()
+
+
+def test_sessions_without_a_key_stay_unlinked(tmp_path: Path) -> None:
+    conn = _open_db(tmp_path)
+    try:
+        _insert_session(conn, "s-1", branch=None)
+        _insert_session(conn, "s-2", branch="feat/x", repo=None)
+        _insert_pr(conn, 1, head_branch="feat/x")
+
+        result = linker.resolve_links(conn, patterns=[])
+
+        assert _links(conn) == {}
+        assert result.unlinked_sessions == 2
+        # 行は消えない（A-004: 未紐付けも観測対象）
+        assert conn.execute("SELECT COUNT(*) FROM sessions").fetchone() == (2,)
+    finally:
+        conn.close()
+
+
+def test_resolve_links_is_idempotent(tmp_path: Path) -> None:
+    conn = _open_db(tmp_path)
+    try:
+        _insert_session(conn, "s-1", branch="feat/x")
+        _insert_pr_ref(conn, "s-1", 7)
+        _insert_session(conn, "s-2", branch="feat/y")
+        _insert_pr(conn, 9, head_branch="feat/y")
+
+        first = linker.resolve_links(conn, patterns=[])
+        second = linker.resolve_links(conn, patterns=[])
+
+        assert sum(first.linked_by_source.values()) == 2
+        # 2 回目に増える分は無い。件数はそのまま「今回増えた分」を表す。
+        assert sum(second.linked_by_source.values()) == 0
+        assert len(_links(conn)) == 2
+    finally:
+        conn.close()
+
+
+def test_branch_is_not_a_join_key_without_a_matching_pr(tmp_path: Path) -> None:
+    """チケットキーが一致しても、それだけではリンクを作らない（issue_key は補助キー）。"""
+    conn = _open_db(tmp_path)
+    try:
+        _insert_session(conn, "s-1", branch="feat/SAMPLE-1", issue_key="SAMPLE-1")
+        _insert_pr(conn, 1, issue_key="SAMPLE-1", head_branch="other/branch")
+
+        linker.resolve_links(conn, patterns=PATTERNS)
+
+        assert _links(conn) == {}
+    finally:
+        conn.close()
+
+
+def test_issue_keys_are_assigned_independently_of_links(tmp_path: Path) -> None:
+    """リンクの不成立とチケットキーの不在は独立した事象（A-004）。"""
+    conn = _open_db(tmp_path)
+    try:
+        _insert_session(conn, "s-1", branch="feat/SAMPLE-1-add")
+        _insert_pr(conn, 1, head_branch="feat/SAMPLE-2-fix")
+
+        result = linker.resolve_links(conn, patterns=PATTERNS)
+
+        assert _links(conn) == {}
+        assert result.issue_keys_assigned == 2
+        assert conn.execute("SELECT issue_key FROM sessions").fetchone() == ("SAMPLE-1",)
+        assert conn.execute("SELECT issue_key FROM pull_requests").fetchone() == ("SAMPLE-2",)
+    finally:
+        conn.close()
+
+
+def test_issue_keys_are_not_assigned_without_patterns(tmp_path: Path) -> None:
     conn = _open_db(tmp_path)
     try:
         _insert_session(conn, "s-1", branch="feat/SAMPLE-1-add")
 
-        first = linker.relink_sessions(conn, patterns=PATTERNS)
-        second = linker.relink_sessions(conn, patterns=PATTERNS)
+        result = linker.resolve_links(conn, patterns=[])
 
-        assert first.updated == 1
-        assert second.updated == 0
-        assert second.scanned == 1
+        assert result.issue_keys_assigned == 0
+        assert conn.execute("SELECT issue_key FROM sessions").fetchone() == (None,)
+    finally:
+        conn.close()
+
+
+def test_assigning_issue_keys_is_idempotent(tmp_path: Path) -> None:
+    conn = _open_db(tmp_path)
+    try:
+        _insert_session(conn, "s-1", branch="feat/SAMPLE-1-add")
+
+        first = linker.assign_issue_keys(conn, patterns=PATTERNS)
+        second = linker.assign_issue_keys(conn, patterns=PATTERNS)
+
+        assert (first, second) == (1, 0)
         assert conn.execute("SELECT issue_key FROM sessions").fetchone() == ("SAMPLE-1",)
     finally:
         conn.close()
 
 
-def test_relink_does_not_clear_existing_key_when_branch_has_none(tmp_path: Path) -> None:
+def test_existing_issue_key_is_never_overwritten(tmp_path: Path) -> None:
+    """付与済みの情報を失わない（A-004）。別の情報源で埋めた値を壊さない。"""
     conn = _open_db(tmp_path)
     try:
-        _insert_session(conn, "s-1", branch="feat/no-key", issue_key="SAMPLE-9")
+        _insert_session(conn, "s-1", branch="feat/SAMPLE-1-add", issue_key="SAMPLE-9")
 
-        result = linker.relink_sessions(conn, patterns=PATTERNS)
+        assigned = linker.assign_issue_keys(conn, patterns=PATTERNS)
 
-        assert result.updated == 0
-        assert result.unlinked == 0
+        assert assigned == 0
         assert conn.execute("SELECT issue_key FROM sessions").fetchone() == ("SAMPLE-9",)
-    finally:
-        conn.close()
-
-
-def test_collect_link_stats_on_empty_db(tmp_path: Path) -> None:
-    conn = _open_db(tmp_path)
-    try:
-        stats = linker.collect_link_stats(conn)
-
-        assert stats == linker.LinkStats(
-            sessions_total=0,
-            sessions_linked=0,
-            prs_total=0,
-            prs_linked=0,
-            task_effort_keys=0,
-            joined_keys=0,
-            sessions_only_keys=0,
-            prs_only_keys=0,
-        )
-        assert stats.sessions_link_rate == 0.0
-        assert stats.prs_link_rate == 0.0
-    finally:
-        conn.close()
-
-
-def test_collect_link_stats_counts_join_state(tmp_path: Path) -> None:
-    conn = _open_db(tmp_path)
-    try:
-        _insert_session(conn, "s-1", branch="feat/SAMPLE-1", issue_key="SAMPLE-1")
-        _insert_session(conn, "s-2", branch="feat/SAMPLE-2", issue_key="SAMPLE-2")
-        _insert_session(conn, "s-3", branch="feat/no-key")
-        _insert_pr(conn, 1, "SAMPLE-1")
-        _insert_pr(conn, 2, "SAMPLE-3")
-        _insert_pr(conn, 3, None)
-
-        stats = linker.collect_link_stats(conn)
-
-        assert stats.sessions_total == 3
-        assert stats.sessions_linked == 2
-        assert stats.sessions_link_rate == pytest.approx(66.666, abs=0.01)
-        assert stats.prs_total == 3
-        assert stats.prs_linked == 2
-        assert stats.task_effort_keys == 2
-        assert stats.joined_keys == 1
-        assert stats.sessions_only_keys == 1
-        assert stats.prs_only_keys == 1
     finally:
         conn.close()

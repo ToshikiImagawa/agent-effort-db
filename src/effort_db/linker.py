@@ -1,7 +1,11 @@
-"""issue_key の抽出と、突き合わせ（join）健全性の集計。
+"""セッションと PR の突き合わせ（段階適用）と、チケットキーの抽出。
 
-issue_key は sessions と pull_requests を join する唯一のキーである。抽出できな
-かったレコードは捨てずに issue_key = NULL（unlinked）のまま保持する。
+突き合わせキーは 1 種類ではない。**確実性の高い順に段階適用**し、どのキーで
+紐付いたかを `link_source` として残す。実ログの観測から、チケットキーを含む
+ブランチ名は 1 件も存在しないため、`issue_key` を主軸にすると 1 件も紐付かない
+（design O10 / D6）。`issue_key` はチケット単位の集約に使う補助キーとして扱う。
+
+紐付かなかったセッションは捨てず、リンクが無い状態（`unlinked`）で保持する。
 """
 
 from __future__ import annotations
@@ -10,13 +14,22 @@ import re
 import sqlite3
 from collections.abc import Sequence
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 
 from effort_db import config
 
-# sessions 側の抽出率がこれを下回ったら stats で警告する。ブランチ命名規約の
-# 見直しを促す閾値であり、半分以上取れていないなら規約側の問題とみなす。
-LOW_LINK_RATE_THRESHOLD = 50.0
+
+class LinkSource(Enum):
+    """突き合わせの由来。確実性の高い順に定義する。
+
+    UNLINKED は「リンクが存在しない」ことを表す論理値であり、リンクの実体として
+    永続化されることはない。未紐付け件数を由来別の内訳と同じ軸で扱うために定義する。
+    """
+
+    LOG_REFERENCE = "log_reference"
+    REPO_BRANCH = "repo_branch"
+    UNLINKED = "unlinked"
 
 
 def compile_patterns(patterns: Sequence[str]) -> list[re.Pattern[str]]:
@@ -73,107 +86,110 @@ def extract_issue_key(
 
 
 @dataclass(frozen=True)
-class RelinkResult:
-    """relink_sessions の結果。"""
+class LinkResult:
+    """突き合わせの結果。由来ごとの新規リンク件数と、未紐付けのセッション数。"""
 
-    scanned: int
-    updated: int
-    unlinked: int
+    linked_by_source: dict[LinkSource, int]
+    unlinked_sessions: int
+    issue_keys_assigned: int
 
 
-def relink_sessions(
+# 段 1: ログ内の PR 参照。ログに書かれた事実であり最も確実。
+# 対象 PR が未収集でもリンクを作る。「このセッションがどの PR を出したか」は
+# PR を backfill したかどうかに左右されない観測事実である。
+_LINK_BY_LOG_REFERENCE = """
+INSERT OR IGNORE INTO session_pr_links (session_id, repo, pr_number, link_source, linked_at)
+SELECT r.session_id, r.repo, r.pr_number, ?, datetime('now')
+FROM session_pr_refs r
+JOIN sessions s ON s.session_id = r.session_id
+"""
+
+# 段 2: リポジトリとブランチの一致。既にリンクがあるセッションは対象外にする。
+# 先行する段（より確実な由来）の結果を後続の段が上書きしないため。
+_LINK_BY_REPO_BRANCH = """
+INSERT OR IGNORE INTO session_pr_links (session_id, repo, pr_number, link_source, linked_at)
+SELECT s.session_id, p.repo, p.pr_number, ?, datetime('now')
+FROM sessions s
+JOIN pull_requests p
+  ON p.repo = s.repo AND p.head_branch = s.branch
+WHERE s.repo IS NOT NULL
+  AND s.branch IS NOT NULL
+  AND NOT EXISTS (SELECT 1 FROM session_pr_links l WHERE l.session_id = s.session_id)
+"""
+
+_COUNT_UNLINKED_SESSIONS = """
+SELECT COUNT(*) FROM sessions s
+WHERE NOT EXISTS (SELECT 1 FROM session_pr_links l WHERE l.session_id = s.session_id)
+"""
+
+
+def resolve_links(
     conn: sqlite3.Connection,
     *,
     patterns: Sequence[re.Pattern[str]],
-) -> RelinkResult:
-    """既存 sessions の issue_key を branch から再計算する（冪等）。
+) -> LinkResult:
+    """突き合わせを確実性の高い順に適用する（冪等）。
 
-    stats 実行時の自動再計算ではなく専用経路にしたのは、stats を読み取り専用の
-    診断コマンドに保つため。実行するたびに DB が書き換わると、join 率の変化が
-    データ収集由来かコマンド実行由来か区別できなくなる。
+    後続の段は、先行する段で既にリンクが作られたセッションを対象にしない。
+    由来の確実性の順序を保つためである（design D6）。
 
-    抽出できなかった行の既存 issue_key は消さない。collector がブランチ名以外
-    （コミットメッセージ等）から埋めた値を壊さないため。同じ branch と同じ
-    パターンなら結果は変わらないので冪等である。
-
-    pull_requests を対象にしないのは、同テーブルにキーの抽出元となるテキスト列
-    （タイトル / ブランチ名）が無く、収集時に埋めるしかないため。
+    チケットキーの付与はリンクの成否とは独立に行う。リンクが作れなかった
+    セッションにもチケットキーは付与されうる（A-004: 片方の失敗が他方を打ち消さない）。
     """
-    rows = conn.execute("SELECT session_id, branch, issue_key FROM sessions").fetchall()
-    updated = 0
-    for session_id, branch, current in rows:
-        extracted = extract_issue_key(branch, patterns=patterns)
-        if extracted is None or extracted == current:
-            continue
-        conn.execute(
-            "UPDATE sessions SET issue_key = ? WHERE session_id = ?",
-            (extracted, session_id),
-        )
-        updated += 1
-    conn.commit()
-    return RelinkResult(
-        scanned=len(rows),
-        updated=updated,
-        unlinked=_count(conn, "SELECT COUNT(*) FROM sessions WHERE issue_key IS NULL"),
-    )
-
-
-@dataclass(frozen=True)
-class LinkStats:
-    """join の健全性を表す件数。率は 0 件でも落ちないようプロパティ側で算出する。"""
-
-    sessions_total: int
-    sessions_linked: int
-    prs_total: int
-    prs_linked: int
-    task_effort_keys: int
-    joined_keys: int
-    sessions_only_keys: int
-    prs_only_keys: int
-
-    @property
-    def sessions_link_rate(self) -> float:
-        return _rate(self.sessions_linked, self.sessions_total)
-
-    @property
-    def prs_link_rate(self) -> float:
-        return _rate(self.prs_linked, self.prs_total)
-
-
-def collect_link_stats(conn: sqlite3.Connection) -> LinkStats:
-    """sessions / pull_requests の issue_key 充填状況と join 状況を集計する（読み取り専用）。"""
-    return LinkStats(
-        sessions_total=_count(conn, "SELECT COUNT(*) FROM sessions"),
-        sessions_linked=_count(conn, "SELECT COUNT(*) FROM sessions WHERE issue_key IS NOT NULL"),
-        prs_total=_count(conn, "SELECT COUNT(*) FROM pull_requests"),
-        prs_linked=_count(conn, "SELECT COUNT(*) FROM pull_requests WHERE issue_key IS NOT NULL"),
-        # task_effort は issue_key で GROUP BY するビューなので、NULL 以外の行数が
-        # 参照側から見える課題の数になる。
-        task_effort_keys=_count(
-            conn, "SELECT COUNT(*) FROM task_effort WHERE issue_key IS NOT NULL"
+    linked_by_source = {
+        LinkSource.LOG_REFERENCE: _execute_link_stage(
+            conn, _LINK_BY_LOG_REFERENCE, LinkSource.LOG_REFERENCE
         ),
-        joined_keys=_count(conn, _set_op_count_sql("INTERSECT", "sessions", "pull_requests")),
-        sessions_only_keys=_count(conn, _set_op_count_sql("EXCEPT", "sessions", "pull_requests")),
-        prs_only_keys=_count(conn, _set_op_count_sql("EXCEPT", "pull_requests", "sessions")),
+        LinkSource.REPO_BRANCH: _execute_link_stage(
+            conn, _LINK_BY_REPO_BRANCH, LinkSource.REPO_BRANCH
+        ),
+    }
+    issue_keys_assigned = assign_issue_keys(conn, patterns=patterns)
+    unlinked = _count(conn, _COUNT_UNLINKED_SESSIONS)
+    conn.commit()
+    return LinkResult(
+        linked_by_source=linked_by_source,
+        unlinked_sessions=unlinked,
+        issue_keys_assigned=issue_keys_assigned,
     )
 
 
-def _set_op_count_sql(operator: str, left: str, right: str) -> str:
-    return (
-        "SELECT COUNT(*) FROM ("
-        f"SELECT issue_key FROM {left} WHERE issue_key IS NOT NULL"
-        f" {operator} "
-        f"SELECT issue_key FROM {right} WHERE issue_key IS NOT NULL"
-        ")"
-    )
+def _execute_link_stage(conn: sqlite3.Connection, sql: str, source: LinkSource) -> int:
+    """1 段を適用し、新しく作られたリンクの件数を返す。
+
+    INSERT OR IGNORE なので rowcount は「無視された行」を含まない。
+    したがって 2 回目の実行では 0 になり、件数がそのまま「今回増えた分」になる。
+    """
+    cursor = conn.execute(sql, (source.value,))
+    return max(cursor.rowcount, 0)
+
+
+def assign_issue_keys(
+    conn: sqlite3.Connection,
+    *,
+    patterns: Sequence[re.Pattern[str]],
+) -> int:
+    """sessions / pull_requests に issue_key を付与する（冪等）。更新した行数を返す。
+
+    抽出元はブランチ名（PR 側は head_branch）とする。既に値がある行は触らない。
+    collector が別の情報源から埋めた値や、以前のパターンで付いた値を壊さないため。
+    パターン未設定時は何もしない（既定パターンを持たない: B-004）。
+    """
+    if not patterns:
+        return 0
+    updated = 0
+    for table, source_column in (("sessions", "branch"), ("pull_requests", "head_branch")):
+        rows = conn.execute(
+            f"SELECT rowid, {source_column} FROM {table} WHERE issue_key IS NULL"
+        ).fetchall()
+        for rowid, source_value in rows:
+            key = extract_issue_key(source_value, patterns=patterns)
+            if key is None:
+                continue
+            conn.execute(f"UPDATE {table} SET issue_key = ? WHERE rowid = ?", (key, rowid))
+            updated += 1
+    return updated
 
 
 def _count(conn: sqlite3.Connection, sql: str) -> int:
     return int(conn.execute(sql).fetchone()[0])
-
-
-def _rate(part: int, total: int) -> float:
-    """割合(%)を返す。空 DB でゼロ除算しないよう total == 0 は 0.0% として扱う。"""
-    if total == 0:
-        return 0.0
-    return part / total * 100

@@ -22,8 +22,10 @@ INTERRUPT_FIELD = "55555555-5555-5555-5555-555555555555"
 INTERRUPT_TEXT = "66666666-6666-6666-6666-666666666666"
 OUTSIDE_REPO = "77777777-7777-7777-7777-777777777777"
 BRANCH_SWITCH = "88888888-8888-8888-8888-888888888888"
+PR_REF = "99999999-9999-9999-9999-999999999999"
+TOKENS = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
 
-FIXTURE_SESSION_COUNT = 8
+FIXTURE_SESSION_COUNT = 10
 
 runner = CliRunner()
 
@@ -49,8 +51,10 @@ def test_parses_normal_session() -> None:
     assert record.wall_clock_min == 10.0
     # 人間のプロンプト 2 件のみ。tool_result / isMeta / isSidechain の user は除外。
     assert record.turns == 2
-    # 主トランスクリプトの tool_use 3 件 + subagents/ の 1 件。
-    assert record.tool_calls == 4
+    # 主エージェントの tool_use は 2 件。isSidechain な 1 件と subagents/ の 1 件は
+    # サブエージェント側に振り分ける（合算すると主エージェント分を復元できない）。
+    assert record.tool_calls == 2
+    assert record.sidechain_tool_calls == 2
     assert record.interrupted is False
 
 
@@ -69,6 +73,8 @@ def test_subagent_transcripts_do_not_create_rows() -> None:
             INTERRUPT_TEXT,
             OUTSIDE_REPO,
             BRANCH_SWITCH,
+            PR_REF,
+            TOKENS,
         ]
     )
 
@@ -94,12 +100,71 @@ def test_empty_file_yields_row_with_null_metrics() -> None:
     assert record.interrupted is False
 
 
-def test_broken_lines_are_skipped() -> None:
+def test_broken_lines_are_skipped_and_counted() -> None:
     record = _parse(REPO_PROJECT_DIR, BROKEN)
 
     assert record.turns == 1
     assert record.tool_calls == 1
     assert record.wall_clock_min == 1.0
+    # 壊れた行・レコードでない JSON は件数として残す（黙って捨てない）
+    assert record.skipped_records == 3
+
+
+def test_tokens_are_separated_between_main_and_subagents() -> None:
+    """合算すると主エージェント分を後から復元できない（design D19）。"""
+    record = _parse(REPO_PROJECT_DIR, TOKENS)
+
+    main = (
+        record.input_tokens,
+        record.output_tokens,
+        record.cache_read_tokens,
+        record.cache_creation_tokens,
+    )
+    sidechain = (
+        record.sidechain_input_tokens,
+        record.sidechain_output_tokens,
+        record.sidechain_cache_read_tokens,
+        record.sidechain_cache_creation_tokens,
+    )
+
+    assert main == (100, 20, 1000, 50)
+    # 本体の isSidechain 分（7,3,9,1）と subagents/ 分（5,2,6,4）の合計
+    assert sidechain == (12, 5, 15, 5)
+
+
+def test_non_numeric_usage_values_are_ignored_without_raising() -> None:
+    """usage の値が数値でなくても収集を止めない（FR-020）。"""
+    record = _parse(REPO_PROJECT_DIR, TOKENS)
+
+    # 3 番目の assistant は usage が文字列 / null / bool。加算されていない
+    assert record.input_tokens == 100
+    assert record.cache_read_tokens == 1000
+
+
+def test_tool_calls_and_tokens_agree_on_what_counts_as_a_subagent() -> None:
+    record = _parse(REPO_PROJECT_DIR, TOKENS)
+
+    assert record.tool_calls == 1
+    # 本体の isSidechain 1 件 + subagents/ の 2 件
+    assert record.sidechain_tool_calls == 3
+
+
+def test_observed_log_versions_are_kept() -> None:
+    record = _parse(REPO_PROJECT_DIR, TOKENS)
+
+    # 混在するバージョンをすべて残す（どのバージョンで欠損が出たか追えるように）
+    assert record.log_versions == "0.0.0-fixture,0.0.1-fixture"
+
+
+def test_sessions_without_subagents_report_zero_not_null() -> None:
+    """観測できて 0 だった場合と、観測できなかった場合を区別する（design D18）。"""
+    with_messages = _parse(REPO_PROJECT_DIR, BROKEN)
+    empty = _parse(REPO_PROJECT_DIR, EMPTY)
+
+    assert with_messages.sidechain_tool_calls == 0
+    assert with_messages.input_tokens == 0
+    assert empty.sidechain_tool_calls is None
+    assert empty.input_tokens is None
 
 
 def test_interrupted_detected_from_structural_field() -> None:
@@ -122,6 +187,46 @@ def test_repo_is_null_outside_host_layout() -> None:
 
 def test_branch_uses_most_frequent_value() -> None:
     assert _parse(REPO_PROJECT_DIR, BRANCH_SWITCH).branch == "main"
+
+
+def test_pr_references_are_collected_from_the_log() -> None:
+    record = _parse(REPO_PROJECT_DIR, PR_REF)
+
+    # 同じ PR への参照が複数回現れても 1 件。別リポジトリの PR も参照として残す。
+    assert record.pr_refs == (("acme/widget", 42), ("acme/other", 43))
+
+
+def test_unparsable_pr_references_are_skipped_without_stopping_collection() -> None:
+    """PR 番号が数値でない・リポジトリが owner/repo でない・キーが無い場合は落とす。"""
+    record = _parse(REPO_PROJECT_DIR, PR_REF)
+
+    assert all(isinstance(pr_number, int) for _, pr_number in record.pr_refs)
+    # 壊れた参照があっても他の観測値は取れている
+    assert record.branch == "feat/pr-ref"
+    assert record.turns == 1
+
+
+def test_pr_reference_records_are_not_counted_as_turns_or_tool_calls() -> None:
+    record = _parse(REPO_PROJECT_DIR, PR_REF)
+
+    assert (record.turns, record.tool_calls) == (1, 1)
+
+
+def test_pr_references_are_stored_and_do_not_duplicate_on_recollection(tmp_path: Path) -> None:
+    conn = _connect(tmp_path / "effort.db")
+    try:
+        record = _parse(REPO_PROJECT_DIR, PR_REF)
+        session.upsert_session(conn, record)
+        session.upsert_session(conn, record)
+        conn.commit()
+
+        rows = conn.execute(
+            "SELECT session_id, repo, pr_number FROM session_pr_refs ORDER BY pr_number"
+        ).fetchall()
+
+        assert rows == [(PR_REF, "acme/widget", 42), (PR_REF, "acme/other", 43)]
+    finally:
+        conn.close()
 
 
 def test_collect_all_is_idempotent(tmp_path: Path) -> None:
@@ -156,6 +261,25 @@ def test_upsert_updates_growing_session(tmp_path: Path) -> None:
         ).fetchall()
 
         assert rows == [(5, "2026-01-05T10:30:00+00:00", 30.0)]
+    finally:
+        conn.close()
+
+
+def test_upsert_records_when_the_data_was_collected(tmp_path: Path) -> None:
+    """`collected_at` は「いつ時点のデータか」を示す観測値。再収集で更新される。"""
+    conn = _connect(tmp_path / "effort.db")
+    try:
+        session.upsert_session(conn, _parse(REPO_PROJECT_DIR, TOKENS))
+        conn.commit()
+
+        row = conn.execute(
+            "SELECT collected_at, log_versions, skipped_records, sidechain_tool_calls"
+            " FROM sessions WHERE session_id = ?",
+            (TOKENS,),
+        ).fetchone()
+
+        assert row[0] is not None
+        assert row[1:] == ("0.0.0-fixture,0.0.1-fixture", 0, 3)
     finally:
         conn.close()
 

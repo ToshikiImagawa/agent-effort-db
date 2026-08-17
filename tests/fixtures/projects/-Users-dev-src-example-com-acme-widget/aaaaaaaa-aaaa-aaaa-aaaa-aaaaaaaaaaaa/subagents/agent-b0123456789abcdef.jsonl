@@ -1,0 +1,2 @@
+{"type":"user","uuid":"su1","timestamp":"2026-01-11T09:00:06.000Z","isSidechain":true,"version":"0.0.1-fixture","message":{"role":"user","content":"サブエージェントへの指示"}}
+{"type":"assistant","uuid":"sa1","parentUuid":"su1","timestamp":"2026-01-11T09:00:07.000Z","isSidechain":true,"version":"0.0.1-fixture","message":{"role":"assistant","content":[{"type":"tool_use","id":"stool-1","name":"Read","input":{}},{"type":"tool_use","id":"stool-2","name":"Grep","input":{}}],"usage":{"input_tokens":5,"output_tokens":2,"cache_read_input_tokens":6,"cache_creation_input_tokens":4}}}
