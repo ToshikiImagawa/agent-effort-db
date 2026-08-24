@@ -2,11 +2,11 @@
 id: "design-effort-db"
 title: "AIエージェント実工数DB & CLI"
 type: "design"
-status: "draft"
+status: "approved"
 sdd-phase: "plan"
 impl-status: "implemented"
 created: "2026-08-16"
-updated: "2026-08-19"
+updated: "2026-08-24"
 depends-on: [ "spec-effort-db" ]
 tags: [ "effort-tracking", "cli", "sqlite", "estimation", "session-log" ]
 category: "core"

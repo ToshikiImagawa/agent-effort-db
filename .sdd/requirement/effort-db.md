@@ -2,9 +2,9 @@
 id: "prd-effort-db"
 title: "AIエージェント実工数DB & CLI"
 type: "prd"
-status: "draft"
+status: "approved"
 created: "2026-08-15"
-updated: "2026-08-17"
+updated: "2026-08-24"
 depends-on: [ ]
 tags: [ "effort-tracking", "cli", "sqlite", "estimation", "session-log" ]
 category: "core"

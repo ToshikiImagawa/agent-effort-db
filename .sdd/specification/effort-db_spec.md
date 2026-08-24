@@ -2,10 +2,10 @@
 id: "spec-effort-db"
 title: "AIエージェント実工数DB & CLI"
 type: "spec"
-status: "draft"
+status: "approved"
 sdd-phase: "specify"
 created: "2026-08-16"
-updated: "2026-08-17"
+updated: "2026-08-24"
 depends-on: [ "prd-effort-db" ]
 tags: [ "effort-tracking", "cli", "sqlite", "estimation", "session-log" ]
 category: "core"
