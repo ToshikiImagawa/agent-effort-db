@@ -72,6 +72,41 @@ issue_key_patterns = ["(?<![0-9A-Za-z])PROJ-[0-9]+(?![0-9A-Za-z])"]
 
 `stats` の join 率が低い場合は、パターンの複雑化よりも先にブランチ命名規約の見直しを検討する。
 
+## Claude Code Plugin として使う
+
+このリポジトリ自体が Claude Code Plugin Marketplace として動作する
+（`.claude-plugin/marketplace.json` が `plugins/effort-db/` を単一プラグインとして公開する）。
+Claude Code のプラグイン配布は marketplace 経由が必須で、`plugin.json` 単体の直接インストールは
+サポートされていない。
+
+```
+/plugin marketplace add ToshikiImagawa/agent-effort-db   # または git clone 済みのローカルパス
+/plugin install effort-db@agent-effort-db
+```
+
+インストール後、以下の Slash command が使える。いずれも内部で
+`uv run --project <このリポジトリのルート> effort-db <サブコマンド>` を呼ぶだけの薄いラッパーで、
+初回実行時のみ `uv` が依存関係を自動 sync するため数十秒かかることがある。
+
+| Slash command             | 対応する CLI コマンド      |
+|:---------------------------|:----------------------|
+| `/effort-db:init`          | `effort-db init`        |
+| `/effort-db:backfill-sessions` | `effort-db backfill sessions` |
+| `/effort-db:backfill-prs`  | `effort-db backfill prs --repo owner/repo [--limit 50]` |
+| `/effort-db:link`          | `effort-db link`        |
+| `/effort-db:stats`         | `effort-db stats`       |
+| `/effort-db:query`         | `effort-db query "<SQL>"` |
+
+`collect-session`（単一セッションの取り込み）は将来の hook 連携専用として、Slash command 化の
+対象外にしている。
+
+また `plugins/effort-db/skills/effort-distribution/` により、「このタスクはどれくらいかかった」
+のような自然言語の問い合わせに対して、`stats`/`query` の実測データから中央値・p90 等の分布を
+提示する（推定ロジックは持たない）。
+
+ローカル開発中のプラグインを marketplace 登録せずに試す場合は
+`claude --plugin-dir plugins/effort-db` で読み込める。
+
 ## 開発
 
 ```bash

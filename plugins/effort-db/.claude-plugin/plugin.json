@@ -1,0 +1,12 @@
+{
+  "name": "effort-db",
+  "description": "Claude Code / AIエージェントの実工数（セッション×PR）を収集・参照するCLIをSlash command/Skillから使う",
+  "version": "0.1.0",
+  "author": {
+    "name": "Toshiki Imagawa",
+    "url": "https://github.com/ToshikiImagawa"
+  },
+  "license": "MIT",
+  "homepage": "https://github.com/ToshikiImagawa/agent-effort-db",
+  "repository": "https://github.com/ToshikiImagawa/agent-effort-db"
+}

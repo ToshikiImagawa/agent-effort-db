@@ -69,6 +69,19 @@ Claude Code が出す工数見積もりは「人間が実施する前提」で�
 ```
 agent-effort-db/
 ├── pyproject.toml          # [project.scripts] effort-db = "effort_db.cli:app"
+├── .claude-plugin/
+│   └── marketplace.json    # Plugin配布は marketplace 経由が必須（plugin.json単体では不可）
+├── plugins/effort-db/       # Claude Code Plugin 本体（実装済み。A-006）
+│   ├── .claude-plugin/plugin.json
+│   ├── commands/            # Slash command。collect-session は対象外
+│   │   ├── init.md
+│   │   ├── backfill-sessions.md
+│   │   ├── backfill-prs.md
+│   │   ├── link.md
+│   │   ├── stats.md
+│   │   └── query.md
+│   └── skills/effort-distribution/
+│       └── SKILL.md         # stats/query から分布(中央値/p90)を提示（実装済み）
 ├── src/effort_db/
 │   ├── cli.py              # typer アプリ（全コマンド実装済み）
 │   ├── schema.py           # DDL + マイグレーション（v2。v1 からの移行込み）
@@ -134,8 +147,9 @@ effort-db query "..."               # 素のSQL逃げ道（読み取り専用）
 
 ## 未決定事項（後回し）
 
-- インクリメンタル収集の方式（Stop hook / SessionEnd hook / PR作成コマンド後段 / cron）
-- skill / MCP / プラグインとしての参照側の実装
+- インクリメンタル収集の方式（Stop hook / SessionEnd hook / PR作成コマンド後段 / cron）。
+  `collect-session` はこの方式が決まるまで Slash command 化していない
+- MCP化（CLI 関数を import する薄い `mcp.py` を追加する方針は A-006 の表にあるが未実装）
 - チーム共有DB化（SQLite → Cloud SQL / BigQuery 等）
 - Codex等の他エージェントセッションの取り込み（リポジトリ名を `agent-` としたのはこの余地のため）
 - org への移管、公開範囲の拡大

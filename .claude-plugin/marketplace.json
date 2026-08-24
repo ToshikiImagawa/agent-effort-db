@@ -1,0 +1,31 @@
+{
+  "name": "agent-effort-db",
+  "metadata": {
+    "description": "Claude Code / AIエージェントの実工数（セッション×PR）を収集・蓄積するローカルDB & CLI のプラグインマーケットプレイス",
+    "version": "0.1.0"
+  },
+  "owner": {
+    "name": "Toshiki Imagawa",
+    "url": "https://github.com/ToshikiImagawa"
+  },
+  "plugins": [
+    {
+      "name": "effort-db",
+      "source": "./plugins/effort-db",
+      "description": "Claude Code / AIエージェントの実工数（セッション×PR）を収集・参照するCLIをSlash command/Skillから使う",
+      "version": "0.1.0",
+      "author": {
+        "name": "Toshiki Imagawa",
+        "url": "https://github.com/ToshikiImagawa"
+      },
+      "category": "development",
+      "license": "MIT",
+      "tags": [
+        "effort-tracking",
+        "sessions",
+        "pull-requests",
+        "cli"
+      ]
+    }
+  ]
+}
