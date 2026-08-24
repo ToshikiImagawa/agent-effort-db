@@ -11,6 +11,8 @@ from pathlib import Path
 from typing import Any
 
 ENV_DB_PATH = "EFFORT_DB_PATH"
+# Claude Code 本体がこれを設定していれば ~/.claude の代わりに使う（design D24）。
+ENV_CLAUDE_CONFIG_DIR = "CLAUDE_CONFIG_DIR"
 DEFAULT_DATA_DIR = Path.home() / ".claude" / "plugins" / "data" / "effort-db"
 DEFAULT_DB_NAME = "effort.db"
 CONFIG_FILE_NAME = "config.toml"
@@ -20,14 +22,14 @@ CONFIG_KEY_ISSUE_KEY_PATTERNS = "issue_key_patterns"
 def resolve_db_path(*, data_dir: Path | None = None) -> Path:
     """DBファイルパスを解決する。
 
-    `data_dir` はデフォルト値（DEFAULT_DATA_DIR）を上書きするためのフックで、
+    `data_dir` はデフォルト値（`_default_data_dir()`）を上書きするためのフックで、
     config.toml の探索先とデフォルトDBパスの両方に影響する。テストからの注入用。
     """
     env_value = os.environ.get(ENV_DB_PATH)
     if env_value:
         return _ensure_parent(Path(env_value).expanduser())
 
-    base_dir = data_dir if data_dir is not None else DEFAULT_DATA_DIR
+    base_dir = data_dir if data_dir is not None else _default_data_dir()
     configured = _load_config(base_dir).get("db_path")
     if configured:
         return _ensure_parent(Path(configured).expanduser())
@@ -41,13 +43,25 @@ def load_issue_key_patterns(*, data_dir: Path | None = None) -> list[str] | None
     既定パターンをここに持たないのは、社内固有のチケットキー接頭辞を設定ファイル
     側だけに閉じ込め、ソースには汎用パターンのみを置くため（既定値は linker が持つ）。
     """
-    base_dir = data_dir if data_dir is not None else DEFAULT_DATA_DIR
+    base_dir = data_dir if data_dir is not None else _default_data_dir()
     patterns = _load_config(base_dir).get(CONFIG_KEY_ISSUE_KEY_PATTERNS)
     if patterns is None:
         return None
     if not isinstance(patterns, list) or not all(isinstance(p, str) for p in patterns):
         raise ValueError(f"{CONFIG_KEY_ISSUE_KEY_PATTERNS} は文字列の配列で指定してください")
     return list(patterns)
+
+
+def _default_data_dir() -> Path:
+    """既定のデータディレクトリを解決する。
+
+    Claude Code 本体は CLAUDE_CONFIG_DIR が設定されていれば ~/.claude の代わりに
+    それを設定ディレクトリとして使う。本ツールもこれに追従する（design D24）。
+    """
+    config_dir = os.environ.get(ENV_CLAUDE_CONFIG_DIR)
+    if config_dir:
+        return Path(config_dir).expanduser() / "plugins" / "data" / "effort-db"
+    return DEFAULT_DATA_DIR
 
 
 def _load_config(base_dir: Path) -> dict[str, Any]:

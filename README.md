@@ -22,8 +22,15 @@ uv run effort-db query "SELECT * FROM effort_by_branch LIMIT 10"   # 任意の S
 DB パスは以下の優先順位で解決される（環境変数 > `config.toml` > デフォルト）:
 
 1. 環境変数 `EFFORT_DB_PATH`
-2. `~/.claude/plugins/data/effort-db/config.toml` の `db_path`
-3. デフォルト: `~/.claude/plugins/data/effort-db/effort.db`
+2. `<データディレクトリ>/config.toml` の `db_path`
+3. デフォルト: `<データディレクトリ>/effort.db`
+
+`<データディレクトリ>` は環境変数 `CLAUDE_CONFIG_DIR` が設定されていれば
+`$CLAUDE_CONFIG_DIR/plugins/data/effort-db`、未設定であれば
+`~/.claude/plugins/data/effort-db`（Claude Code 本体の既定と同じ挙動）。
+セッションログの探索先（`backfill sessions` / `collect-session`）も同様に、
+`CLAUDE_CONFIG_DIR` が設定されていれば `$CLAUDE_CONFIG_DIR/projects`、
+未設定であれば `~/.claude/projects` を既定とする。
 
 ### 突き合わせ（`link`）
 

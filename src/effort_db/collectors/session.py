@@ -20,6 +20,7 @@ PR 参照を `session_pr_refs` の行として保存する。
 from __future__ import annotations
 
 import json
+import os
 import re
 import sqlite3
 from collections import Counter
@@ -28,6 +29,8 @@ from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
+
+from effort_db import config
 
 DEFAULT_PROJECTS_DIR = Path.home() / ".claude" / "projects"
 
@@ -101,12 +104,23 @@ def iter_session_files(projects_dir: Path | None = None) -> Iterator[Path]:
 
     特に journal.jsonl は複数セッションで同名なので、拾うと session_id が衝突する。
     """
-    base = projects_dir if projects_dir is not None else DEFAULT_PROJECTS_DIR
+    base = projects_dir if projects_dir is not None else _default_projects_dir()
     if not base.is_dir():
         return
     yield from sorted(
         path for path in base.glob("*/*.jsonl") if _SESSION_ID_PATTERN.fullmatch(path.stem)
     )
+
+
+def _default_projects_dir() -> Path:
+    """既定のプロジェクトディレクトリ（セッションログの探索起点）を解決する。
+
+    config.py と同じ方針で CLAUDE_CONFIG_DIR に追従する（design D24）。
+    """
+    config_dir = os.environ.get(config.ENV_CLAUDE_CONFIG_DIR)
+    if config_dir:
+        return Path(config_dir).expanduser() / "projects"
+    return DEFAULT_PROJECTS_DIR
 
 
 def parse_session_file(path: Path) -> SessionRecord:

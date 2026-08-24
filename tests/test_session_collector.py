@@ -320,6 +320,26 @@ def test_iter_session_files_tolerates_missing_dir(tmp_path: Path) -> None:
     assert list(session.iter_session_files(tmp_path / "absent")) == []
 
 
+def test_iter_session_files_uses_claude_config_dir_env_var(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv(config.ENV_CLAUDE_CONFIG_DIR, str(tmp_path))
+    project_dir = tmp_path / "projects" / "some-project"
+    project_dir.mkdir(parents=True)
+    log_path = project_dir / f"{NORMAL}.jsonl"
+    log_path.write_text((REPO_PROJECT_DIR / f"{NORMAL}.jsonl").read_text())
+
+    assert list(session.iter_session_files()) == [log_path]
+
+
+def test_iter_session_files_projects_dir_overrides_claude_config_dir(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # CLAUDE_CONFIG_DIR 側には projects/ が存在しないため、これが優先されていたら
+    # 結果は空になる。FIXTURES_DIR の件数が返ることで projects_dir 引数の優先を確認する。
+    monkeypatch.setenv(config.ENV_CLAUDE_CONFIG_DIR, str(tmp_path / "unused"))
+
+    assert len(list(session.iter_session_files(FIXTURES_DIR))) == FIXTURE_SESSION_COUNT
+
+
 def test_cli_backfill_sessions(tmp_path: Path, monkeypatch) -> None:
     db_path = tmp_path / "effort.db"
     monkeypatch.setenv(config.ENV_DB_PATH, str(db_path))

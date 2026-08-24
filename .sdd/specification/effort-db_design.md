@@ -165,7 +165,7 @@ graph TD
 | `linker`                    | 突き合わせの段階適用、由来付きリンクの保存、チケットキー抽出                 | schema / config         | `src/effort_db/linker.py`              |
 | `stats`                     | 収集件数・キー種別ごとの join 率・未紐付け件数の算出                 | linker / schema         | `src/effort_db/stats.py`               |
 | `schema`                    | 接続の生成、DDL、ビュー定義、スキーマバージョン管理とマイグレーション            | なし                      | `src/effort_db/schema.py`              |
-| `config`                    | DB パス解決、`config.toml` の読み込み                   | なし                      | `src/effort_db/config.py`              |
+| `config`                    | DB パス解決（`CLAUDE_CONFIG_DIR` によるベースディレクトリ切り替え込み）、`config.toml` の読み込み | なし                      | `src/effort_db/config.py`              |
 
 **spec 4.1 の型は専用モジュール（`models`）に集約せず、その型を生み出すモジュールに置く。**
 `SessionRecord` は `collectors.session`、`LinkSource` / `LinkResult` は `linker` が持つ。
@@ -477,7 +477,7 @@ _SESSION_ID_PATTERN = re.compile(
 
 def iter_session_files(projects_dir: Path | None = None) -> Iterator[Path]:
     """セッション本体の jsonl を列挙する。ディレクトリが無ければ何も返さない。"""
-    base = projects_dir if projects_dir is not None else DEFAULT_PROJECTS_DIR
+    base = projects_dir if projects_dir is not None else _default_projects_dir()
     if not base.is_dir():
         return
     yield from sorted(
@@ -488,6 +488,9 @@ def iter_session_files(projects_dir: Path | None = None) -> Iterator[Path]:
 `glob("*/*.jsonl")` が 1 階層に限定する役割を、`fullmatch(path.stem)` が
 ファイル名の形式を検証する役割を担う。**どちらか一方だけでは不十分**である
 （`workflows/**/journal.jsonl` は深さで、`subagents/agent-*.jsonl` は名前で弾かれる）。
+
+`projects_dir` を明示指定しない場合、`CLAUDE_CONFIG_DIR` が設定されていればそれ配下の
+`projects/` を、未設定なら `~/.claude/projects` を既定とする（D24）。
 
 
 ## 6.2. 正規化（外部形式への依存を閉じ込める段）
@@ -1023,6 +1026,7 @@ S5 以降はセッション本体（`<project>/<UUID>.jsonl`）のみを母集�
 | D21 | 未収集 PR へのログ参照       | (a) `pull_requests` に存在する PR だけリンクする (b) 存在しなくてもリンクする    | **(b) 存在しなくてもリンクする**                    | 「このセッションがどの PR を出したか」は PR を backfill したかどうかに左右されない観測事実である。(a) にすると join 率が収集範囲に応じて動き、突き合わせの良否を測る指標にならない。集約ビューでは PR 側の値が NULL になるだけで、重複計上や誤りは生じない。収集範囲の影響を見るために、`stats` は PR 収集済みリポジトリに限った join 率も併せて出す |
 | D22 | repo 未導出セッションの `git remote` 補完 | (a) cwd から `git remote` を引いて補完する (b) 補完しない（`(repo, branch)` が得られない分は unlinked のまま） | **(b) 補完しない** | O30。未導出 538 件のうちディレクトリの残存率は 95.4% と高いが、そのうち git の作業ツリーであるものは 1.7%（9 件）のみで、残りは cwd がそもそも git リポジトリの外を指している。補完しても導出可能率は 53.7% → 54.5%（+0.8pt）にしかならず、実装コスト（git 呼び出し・タイムアウト処理・パース）に対して効果が乏しい |
 | D23 | `input_tokens` の解釈             | (a) セッション内の単純合計を「投入した文脈量」の指標として使う (b) `cache_read_tokens` を再利用された文脈量、`cache_creation_tokens` を新規導入分として使い、`input_tokens` は文脈量の指標として扱わない | **(b)** | O31。`input_tokens` はプロンプトキャッシュにより全体の 0.0% しか占めず、文脈量の指標にならない。文脈の推移は `cache_read_tokens`（再利用。97.6%）と `cache_creation_tokens`（新規導入。2.4%）に現れる。コストを再構成する際は 4 種すべてを実際の課金レート（cache read/write は input と単価が異なる）で重み付けする必要がある |
+| D24 | セッションログ探索・データディレクトリの既定値の解決 | (a) 常に `~/.claude` 固定 (b) `CLAUDE_CONFIG_DIR` が設定されていればそれを優先し `~/.claude` にフォールバック | **(b)** | Claude Code 本体は `CLAUDE_CONFIG_DIR` が設定されている場合、セッション履歴・プラグインデータの保存先をそれに切り替える。本ツールがこれを無視すると、`CLAUDE_CONFIG_DIR` を設定した CI 環境（Claude Code のプラグイン/スキルから実行される想定）で `backfill sessions` の収集件数が 0 件になる、あるいは DB が想定外の場所に作られる。`config.py`（`DEFAULT_DATA_DIR`）と `session.py`（`DEFAULT_PROJECTS_DIR`）の両方をスコープに含める。環境変数は呼び出し時点で毎回読む（モジュールロード時に固定すると `monkeypatch.setenv` によるテストが効かない） |
 
 ### 実装から取り込んだ判断
 
@@ -1068,6 +1072,19 @@ D16 は D2（サブエージェントのツール呼び出しを別列で保持�
 ---
 
 # 10. 変更履歴
+
+## v0.10（2026-08-24）
+
+`CLAUDE_CONFIG_DIR` 環境変数への追随を追加した（D24 / issue #10）。
+
+- `collectors/session.py` のセッションログ探索（`iter_session_files` の既定ディレクトリ）が
+  `CLAUDE_CONFIG_DIR` を優先し、未設定時は `~/.claude/projects` にフォールバックするようにした
+- 同様に `config.py` の DB 配置先解決（`resolve_db_path` / `load_issue_key_patterns` の既定
+  データディレクトリ）も `CLAUDE_CONFIG_DIR` に追随するようにした（issue #10 のスコープを
+  config.py にも拡大した。実データ調査ではなく、Claude Code 本体の環境変数仕様との整合性の問題）
+- 環境変数名の定義（`ENV_CLAUDE_CONFIG_DIR`）は `config.py` に一元化し、`session.py` はそこから
+  import する。これにより 4.1 節で既に許可されていた `collectors.session --> config` の依存が
+  初めて実装で使われるようになった
 
 ## v0.9（2026-08-19）
 
